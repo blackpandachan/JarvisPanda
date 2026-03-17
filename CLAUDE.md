@@ -323,12 +323,15 @@ Shared SQLite volumes at `/data/`: `memory.db`, `telemetry.db`, `traces.db`, `sc
 ### Three-tier escalation
 
 ```
-Tier 1  qwen3:8b via Ollama       — handles all queries locally
+Tier 1  qwen3:8b via Ollama         — handles all queries locally
    ↓  stuck after 4 turns on a technical task
-Tier 2  Gemini Flash              — second opinion / implementation plan
+Tier 2  Gemini 3 Flash              — second opinion / implementation plan
    ↓  Gemini confirms code changes needed
-Tier 3  GitHub issue (claude-code-work label) → GitHub Actions → Claude Code GitHub App
-         → implements fix on branch → opens PR → Discord notified
+Tier 3  GitHub issue (claude-code-work label)
+         → GitHub Actions fires (claude-issue-worker.yml)
+         → gemini_implement.py gathers codebase context + calls Gemini 3 Flash
+         → applies file changes, commits to branch, opens PR
+         → Discord notified → local agents verify + !merge <pr#>
 ```
 
 Never call `github_issue` without first trying `gemini_escalate`. See `AGENTS.md` for the full agent guide (tool reference, memory rules, what not to do).
@@ -344,7 +347,7 @@ github_issue created (claude-code-work label)
   → local agents verify and merge: !merge <pr#>  or  👍 reaction
 ```
 
-The `jarvis-claude-worker` container only ensures labels exist — it no longer runs AI itself. All AI implementation work happens in GitHub Actions via the Claude Code GitHub App (no `ANTHROPIC_API_KEY` needed; uses Claude Max subscription).
+The `jarvis-claude-worker` container only ensures labels exist — it no longer runs AI itself. All AI implementation work happens in GitHub Actions via `.github/scripts/gemini_implement.py` using Gemini 3 Flash (`GEMINI_API_KEY`).
 
 ### Key environment variables
 
@@ -358,7 +361,7 @@ The `jarvis-claude-worker` container only ensures labels exist — it no longer 
 | `TAVILY_API_KEY` | | Richer web search (falls back to DuckDuckGo) |
 | `GITHUB_WEBHOOK_SECRET` | | Optional: instant issue pickup via webhook (expose `GITHUB_WEBHOOK_PORT=9000`) |
 
-**Note:** `ANTHROPIC_API_KEY` is NOT required. Tier 3 AI work uses the Claude Code GitHub App via OAuth (Claude Max subscription). Set `DISCORD_DIGEST_WEBHOOK` as both a Docker env var and a GitHub Actions secret (`Settings → Secrets → Actions`).
+**Note:** `ANTHROPIC_API_KEY` is NOT required anywhere. Tier 3 uses Gemini 3 Flash via `GEMINI_API_KEY`. Add both `GEMINI_API_KEY` and `DISCORD_DIGEST_WEBHOOK` as GitHub Actions secrets (`Settings → Secrets → Actions`) in addition to the Docker env vars.
 
 Full variable list: `deploy/README.md`.
 
