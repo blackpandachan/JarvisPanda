@@ -77,12 +77,26 @@ def ensure_labels() -> None:
     with httpx.Client(headers=_gh_headers(), timeout=15) as http:
         for name, color in LABEL_COLORS.items():
             r = http.get(f"{GITHUB_API}/repos/{GITHUB_REPO}/labels/{name}")
+            if r.status_code == 200:
+                continue  # already exists
             if r.status_code == 404:
-                http.post(
+                create = http.post(
                     f"{GITHUB_API}/repos/{GITHUB_REPO}/labels",
                     json={"name": name, "color": color},
                 )
-                log.info("Created label: %s", name)
+                if create.status_code == 201:
+                    log.info("Created label: %s", name)
+                elif create.status_code == 403:
+                    log.warning(
+                        "Cannot create label %r — GitHub token needs 'repo' write scope "
+                        "(got 403). Issues will still be polled but labels won't be managed.",
+                        name,
+                    )
+                else:
+                    log.warning(
+                        "Unexpected status %d creating label %r: %s",
+                        create.status_code, name, create.text[:200],
+                    )
 
 
 def get_queued_issues() -> list[dict]:

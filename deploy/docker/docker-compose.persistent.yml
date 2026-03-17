@@ -20,20 +20,21 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 15s
+      start_period: 20s
 
-  # ── Discord bot ─────────────────────────────────────────────────────────────
+  # ── Discord bot (runs full OpenJarvis SDK — local model, no API proxy) ───────
   jarvis-discord:
     build:
-      context: ../discord
-      dockerfile: Dockerfile
-    depends_on:
-      jarvis-server:
-        condition: service_healthy
+      context: ../..                          # needs src/ for openjarvis package
+      dockerfile: deploy/discord/Dockerfile
+    volumes:
+      - ./config.persistent.toml:/root/.openjarvis/config.toml:ro
+      - jarvis-data:/data                     # shared memory with jarvis-server
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach Ollama on host
     env_file: ../.env
-    environment:
-      JARVIS_URL: "http://jarvis-server:8000"
     restart: unless-stopped
+    # No dependency on jarvis-server — runs its own agent pipeline directly
 
   # ── HN AI digest scheduler ──────────────────────────────────────────────────
   jarvis-digest:
@@ -43,8 +44,6 @@ services:
     volumes:
       - jarvis-reports:/reports
     env_file: ../.env
-    environment:
-      JARVIS_URL: "http://jarvis-server:8000"
     restart: unless-stopped
 
   # ── Claude Code issue worker ────────────────────────────────────────────────
@@ -55,14 +54,12 @@ services:
     volumes:
       - ./config.persistent.toml:/root/.openjarvis/config.toml:ro
       - jarvis-data:/data
-      # Mount the repo so ClaudeCodeAgent has a workspace to read/write
-      - ../..:/workspace
+      - ../..:/workspace                      # repo for ClaudeCodeAgent to work in
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file: ../.env
     environment:
       WORKSPACE: "/workspace"
-      JARVIS_URL: "http://jarvis-server:8000"
     restart: unless-stopped
 
 volumes:

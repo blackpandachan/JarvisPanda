@@ -1,0 +1,18 @@
+# Normalise line endings to LF in the repo; checkout as-is on all platforms.
+* text=auto eol=lf
+
+# Explicitly binary — never touch line endings
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.icns binary
+*.woff binary
+*.woff2 binary
+*.ttf  binary
+*.otf  binary
+*.db   binary
+*.sqlite binary
+*.lock binary
+
+# Rust/Cargo lock — keep as text LF
+Cargo.lock text eol=lf

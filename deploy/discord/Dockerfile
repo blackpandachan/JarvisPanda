@@ -1,9 +1,18 @@
+# Jarvis Discord bot — runs the full OpenJarvis SDK in-process
+# Uses local qwen3:8b via Ollama (host.docker.internal:11434)
+
 FROM python:3.12-slim
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py .
+# Install openjarvis from source + discord.py
+COPY pyproject.toml README.md ./
+COPY src/ src/
 
-CMD ["python", "bot.py"]
+RUN pip install --no-cache-dir uv && \
+    uv pip install --system ".[server]" && \
+    uv pip install --system "discord.py>=2.3"
+
+COPY deploy/discord/bot.py /bot.py
+
+CMD ["python", "/bot.py"]
