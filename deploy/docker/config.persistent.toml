@@ -87,13 +87,23 @@ context_max_tokens = 1500
 # ── MCP ──────────────────────────────────────────────────────────────────────
 [tools.mcp]
 enabled = true
+# To add MCP servers, uncomment and fill in:
+# [[tools.mcp.servers]]
+# name    = "filesystem"
+# command = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/data"]
+#
+# [[tools.mcp.servers]]
+# name    = "github"
+# command = ["npx", "-y", "@modelcontextprotocol/server-github"]
+# env     = { GITHUB_PERSONAL_ACCESS_TOKEN = "${GITHUB_TOKEN}" }
 
 # ── Telemetry ────────────────────────────────────────────────────────────────
 [telemetry]
 enabled              = true
 db_path              = "/data/telemetry.db"
-gpu_metrics          = false   # set true if pynvml is available in container
+gpu_metrics          = true    # pynvml installed in container image
 gpu_poll_interval_ms = 100
+energy_vendor        = ""      # auto-detect: nvidia | amd | apple | cpu_rapl
 
 # ── Traces ───────────────────────────────────────────────────────────────────
 [traces]
@@ -106,13 +116,35 @@ host  = "0.0.0.0"
 port  = 8000
 agent = "orchestrator"
 
+# ── Scheduler ────────────────────────────────────────────────────────────────
+# TaskScheduler daemon — polls SQLite every 60s for due tasks
+[scheduler]
+enabled       = true
+db_path       = "/data/scheduler.db"
+poll_interval = 60
+default_agent = "orchestrator"   # tasks that omit 'agent' use this
+
 # ── Security ─────────────────────────────────────────────────────────────────
+# PII scanning + guardrails enabled; no sandboxing (personal hardware)
 [security]
-enabled = false
+enabled = true
 
 # ── Learning ─────────────────────────────────────────────────────────────────
+# Traces are already collected — enable the feedback loop to improve routing
 [learning]
-enabled = false
+enabled = true
 
 [learning.routing]
-policy = "heuristic"
+policy = "heuristic"   # start with heuristic; switch to "learned" after ~500 traces
+
+[learning.intelligence]
+policy = "none"        # no fine-tuning yet — set to "sft" when LoRA deps available
+
+[learning.agent]
+policy = "none"        # AgentConfigEvolver disabled until baseline is established
+
+[learning.metrics]
+accuracy_weight   = 0.6
+latency_weight    = 0.2
+cost_weight       = 0.1
+efficiency_weight = 0.1

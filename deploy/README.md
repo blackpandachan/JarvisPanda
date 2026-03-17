@@ -68,8 +68,12 @@ Scheduled (every 3 days by default).  Fetches top AI/ML stories from Hacker News
 ranked by comment count, posts a single Discord embed.
 
 ### `jarvis-claude-worker` — Autonomous issue worker
-Polls GitHub every 5 minutes for `claude-code-work` labelled issues.
+Polls GitHub every 5 minutes for `claude-code-work` labelled issues (or wakes instantly via GitHub webhook).
 Creates a branch, runs ClaudeCodeAgent against the issue, pushes a PR, notifies Discord.
+
+**Instant pickup via webhook (recommended):** Set `GITHUB_WEBHOOK_SECRET` to any random string, expose port `9000`, then add a webhook in your repo:
+`Settings → Webhooks → Add webhook` — Payload URL: `http://<host>:9000`, Content type: `application/json`, Secret: your `GITHUB_WEBHOOK_SECRET`, Events: **Issues**.
+The worker wakes immediately when a label is added rather than waiting for the next poll cycle.
 
 ### `jarvis-observer` — Health watchdog
 Runs every 30 minutes.  Reads trace/telemetry SQLite DBs, checks GitHub,
@@ -156,6 +160,20 @@ ensuring complex tasks eventually get resolved by a capable agent.
 | `!run-skill <name> [args]` | Execute a registered Jarvis skill |
 | `!ask-gemini <question>` | Ask Gemini Flash directly, bypass local model |
 
+### Scheduled Tasks
+
+| Command | Description |
+|---|---|
+| `!tasks` | List all tasks with status and next-run times |
+| `!schedule cron 0 9 * * * <prompt>` | Create a cron-scheduled background task |
+| `!schedule interval 3600 <prompt>` | Create an interval-based background task |
+| `!pause-task <id>` | Pause a task (temporary; resume recomputes next_run) |
+| `!resume-task <id>` | Resume a paused task |
+| `!cancel-task <id>` | Permanently cancel a task |
+| `!task-log <id>` | Show last 5 run results for a task |
+
+Two tasks are seeded at startup: a daily morning brief (09:00 UTC) and a weekly AI digest (Monday 10:00 UTC). Results are posted to the `DISCORD_DIGEST_WEBHOOK` automatically via the EventBus `scheduler_task_end` event, and stored to memory for `!memory morning_brief` / `!memory weekly_digest`.
+
 Any message in `#jarvis`, `@Jarvis <query>`, or `!ask <query>` triggers a full agent response.
 
 **Reaction approval:** When Jarvis posts a GitHub issue URL, react 👍 to queue it for
@@ -202,6 +220,50 @@ To add a new tool:
 
 ---
 
+## Agent Reference
+
+All agents implement `BaseAgent.run()`. The `jarvis-discord` container uses `orchestrator` for all queries.
+
+| Agent key | Best for |
+|---|---|
+| `orchestrator` | General multi-step tool use (default for JarvisPanda) |
+| `simple` | Single-turn Q&A, no tools |
+| `native_react` | When you need visible Thought-Action-Observation traces |
+| `native_openhands` | Inline Python code generation and execution |
+| `rlm` | Document-scale contexts (stores variables in REPL) |
+| `claude_code` | Spawns Claude Code Node.js subprocess (worker only, requires Node 22+) |
+| `sandboxed` | Wraps any agent in Docker/Podman with disabled networking |
+
+Switch agent per-query: `j.ask(prompt, agent="native_react", tools=[...])`.
+Switch the server default: `[server] agent = "native_react"` in `config.persistent.toml`.
+
+---
+
+## Memory Backends
+
+The stack currently uses **SQLite/FTS5** (zero deps, BM25 ranking, disk-persistent). Upgrade by changing `[tools.storage] default_backend`:
+
+| Backend | Config key | Extra deps | Quality | Persistent |
+|---|---|---|---|---|
+| SQLite/FTS5 | `sqlite` | none | good | ✓ |
+| FAISS | `faiss` | `faiss-cpu`, `sentence-transformers` | high | ✗ (memory) |
+| ColBERTv2 | `colbert` | `colbert-ai`, `torch` | highest | ✗ (memory) |
+| BM25 | `bm25` | `rank_bm25` | good | ✗ (memory) |
+| Hybrid (RRF) | `hybrid` | depends on sub-backends | highest | depends |
+
+To enable FAISS for better semantic retrieval:
+```toml
+[tools.storage]
+default_backend = "faiss"
+db_path = "/data/memory.db"
+```
+Add `faiss-cpu sentence-transformers` to the discord/server Dockerfiles.
+
+**Chunking defaults:** 512 tokens, 64 overlap, splits on `\n\n` paragraph boundaries.
+**Context injection:** top_k=5, min_score=0.1, max_context_tokens=1500 (set in `[memory]`).
+
+---
+
 ## MCP Support
 
 OpenJarvis supports the [Model Context Protocol](https://modelcontextprotocol.io/).
@@ -231,16 +293,39 @@ Skills are TOML-defined multi-step pipelines in `src/openjarvis/skills/data/`.
 
 | Skill | Description |
 |---|---|
-| `deep-research` | 3-search synthesis with memory recall and structured report |
-| `morning-brief` | Weather + top AI story + daily insight |
+| `deep-research` | Multi-turn: web_search × 3 + arxiv + memory recall → structured report |
+| `morning-brief` | Weather + top AI story + daily insight → stored to memory |
 | `topic-research` | Research topic and store findings to memory |
-| `web-summarize` | Summarise a web page |
+| `web-summarize` | Fetch + summarise a web page |
 | `daily-digest` | Summarise recent activity |
 | `code-lint` | Lint and review code |
 | `data-analyze` | Analyse and interpret data |
+| `knowledge-extract` | Extract structured knowledge from documents |
+| `pdf-summarize` | Summarise a PDF document |
+| `security-scan` | Security review of code or config |
 
-To add a skill: create `src/openjarvis/skills/data/my-skill.toml`.
-Skills can chain any registered tool via `tool_name` + `arguments_template` steps.
+The `deep-research` skill mirrors the multi-turn research pattern from the [OpenJarvis docs](https://open-jarvis.github.io/OpenJarvis/tutorials/deep-research/): OrchestratorAgent loops through `web_search → think → memory_store → memory_search → synthesise` until `max_turns` or completion.
+
+**Skill TOML format:**
+```toml
+[skill]
+name        = "my-skill"
+version     = "0.1.0"
+description = "What this skill does"
+author      = "jarvis"
+
+[[skill.steps]]
+tool_name          = "web_search"
+arguments_template = '{"query": "{topic}"}'
+output_key         = "search_results"
+
+[[skill.steps]]
+tool_name          = "think"
+arguments_template = '{"thought": "Summarise: {search_results}"}'
+output_key         = "summary"
+```
+
+Placeholders `{key}` are resolved from execution context; each step's `output_key` becomes available to subsequent steps.
 
 ---
 
@@ -309,13 +394,19 @@ docker compose -f docker-compose.persistent.yml logs -f
 | `DEFAULT_WEATHER_CITY` | | — | Default city for `!weather` |
 | `AGENT_EXTRA_TOOLS` | | — | Comma-separated extra tool names to add |
 | `POLL_INTERVAL` | | `300` | Issue worker poll interval (seconds) |
+| `GITHUB_WEBHOOK_SECRET` | | — | Shared secret for instant issue pickup via webhook (optional) |
+| `GITHUB_WEBHOOK_PORT` | | `9000` | Port the webhook receiver listens on |
 | `MAX_ISSUE_AGE_DAYS` | | `14` | Skip issues older than this |
-| `CLAUDE_WORK_MODE` | | `pr` | `pr` = create branch+PR, `comment` = comment only |
+| `MERGE_STRATEGY` | | `manual` | `manual` = wait for `!merge`/👍 · `auto` = merge after delay · `comment` = legacy |
+| `MERGE_DELAY_MINUTES` | | `15` | Minutes before auto-merge (only when `MERGE_STRATEGY=auto`) |
+| `DEFAULT_BRANCH` | | `main` | Base branch for PRs |
 | `OBSERVER_INTERVAL` | | `1800` | Observer health check interval (seconds) |
 | `OBSERVER_ARXIV_HOUR` | | `8` | UTC hour for daily arXiv digest (-1 to disable) |
 | `DIGEST_INTERVAL_DAYS` | | `3` | HN digest frequency |
 | `DIGEST_TOP_N` | | `15` | Stories per digest |
-| `DIGEST_WINDOW_HOURS` | | `72` | Story age cutoff |
+| `DIGEST_MIN_SCORE` | | `30` | Minimum HN score to include |
+| `SCHEDULER_DB_PATH` | | `/data/scheduler.db` | Path for task scheduler SQLite DB |
+| `AGENT_EXTRA_TOOLS` | | — | Comma-separated extra tool names beyond auto-discovered set |
 
 ---
 
@@ -381,6 +472,47 @@ If merge fails (conflicts), the agent escalates to Gemini for a resolution plan.
           ↓
 10. The stack improves itself over time
 ```
+
+---
+
+## Adding More Messaging Channels
+
+OpenJarvis has 26+ built-in channel integrations (Telegram, Slack, WhatsApp, Signal, Teams, Matrix, IRC, and more) registered in `ChannelRegistry`. The JarvisPanda Discord bot is a custom `discord.py` integration for maximum control — but you can add additional platforms alongside it.
+
+```bash
+# Check what's available
+jarvis channel list
+jarvis channel status
+```
+
+**Slack example** — add to `deploy/.env`:
+```env
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_APP_TOKEN=xapp-...
+```
+
+Then create a channel recipe `deploy/slack/messaging.toml`:
+```toml
+[channel]
+default = "slack"
+
+[agent]
+type        = "orchestrator"
+max_turns   = 5
+temperature = 0.3
+tools       = ["think", "web_search", "memory_store", "memory_search"]
+```
+
+Load with `SystemBuilder`:
+```python
+from openjarvis.recipes import load_recipe
+from openjarvis import SystemBuilder
+
+recipe = load_recipe("deploy/slack/messaging.toml")
+system = SystemBuilder(**recipe.to_builder_kwargs()).build()
+```
+
+The same agent + memory + tools stack that powers Discord will be available on any additional channel. Per-user memory works identically as long as the channel provides a stable user ID.
 
 ---
 

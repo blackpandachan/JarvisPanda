@@ -41,11 +41,16 @@ Optional env vars:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import http.server
+import json
 import logging
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -74,6 +79,13 @@ LABEL_WORK   = os.environ.get("WORKER_LABEL_WORK", "claude-code-work")
 LABEL_WIP    = "claude-code-in-progress"
 LABEL_DONE   = "claude-code-done"
 LABEL_FAILED = "claude-code-failed"
+
+# Webhook receiver (optional — set GITHUB_WEBHOOK_SECRET to enable)
+WEBHOOK_SECRET: str = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+WEBHOOK_PORT: int   = int(os.environ.get("GITHUB_WEBHOOK_PORT", "9000"))
+
+# Event set by webhook thread to wake the poll loop immediately
+_wake_event = threading.Event()
 
 GITHUB_API = "https://api.github.com"
 LABEL_COLORS = {
@@ -589,6 +601,63 @@ def notify_discord_merged_failed(pr_number: int, pr_url: str, reason: str) -> No
     except Exception:
         pass
 
+# ── Webhook receiver ──────────────────────────────────────────────────────────
+
+class _WebhookHandler(http.server.BaseHTTPRequestHandler):
+    """Minimal GitHub webhook receiver that wakes the poll loop on label events."""
+
+    def log_message(self, fmt: str, *args) -> None:  # silence default access log
+        log.debug("webhook: " + fmt, *args)
+
+    def do_POST(self) -> None:
+        length   = int(self.headers.get("Content-Length", 0))
+        body     = self.rfile.read(length)
+
+        # Verify HMAC signature when secret is configured
+        if WEBHOOK_SECRET:
+            sig_header = self.headers.get("X-Hub-Signature-256", "")
+            expected   = "sha256=" + hmac.new(
+                WEBHOOK_SECRET.encode(), body, hashlib.sha256
+            ).hexdigest()
+            if not hmac.compare_digest(sig_header, expected):
+                self._respond(403, b"signature mismatch")
+                return
+
+        event = self.headers.get("X-GitHub-Event", "")
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            self._respond(400, b"bad json")
+            return
+
+        # Wake the poll loop when an issue is labeled with the work label
+        if event == "issues":
+            action     = payload.get("action", "")
+            label_name = payload.get("label", {}).get("name", "")
+            if action == "labeled" and label_name == LABEL_WORK:
+                issue_num = payload.get("issue", {}).get("number", "?")
+                log.info("Webhook: issue #%s labeled %r — waking poll loop", issue_num, LABEL_WORK)
+                _wake_event.set()
+
+        self._respond(200, b"ok")
+
+    def _respond(self, code: int, body: bytes) -> None:
+        self.send_response(code)
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def _start_webhook_server() -> None:
+    """Start the webhook HTTP server in a daemon thread (no-op if no secret set)."""
+    if not WEBHOOK_SECRET:
+        log.info("GITHUB_WEBHOOK_SECRET not set — webhook receiver disabled (polling only)")
+        return
+    server = http.server.HTTPServer(("", WEBHOOK_PORT), _WebhookHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    log.info("Webhook receiver listening on port %d", WEBHOOK_PORT)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def validate_config() -> bool:
@@ -616,6 +685,7 @@ def main() -> None:
         GITHUB_REPO, POLL_INTERVAL, MERGE_STRATEGY,
     )
     ensure_labels()
+    _start_webhook_server()
 
     while True:
         try:
@@ -631,8 +701,10 @@ def main() -> None:
         except Exception as exc:
             log.exception("Main loop error: %s", exc)
 
-        log.info("Sleeping %ds...", POLL_INTERVAL)
-        time.sleep(POLL_INTERVAL)
+        # Wait for next poll, but wake immediately if a webhook fires
+        _wake_event.clear()
+        log.debug("Sleeping up to %ds (wake on webhook)...", POLL_INTERVAL)
+        _wake_event.wait(timeout=POLL_INTERVAL)
 
 
 if __name__ == "__main__":
