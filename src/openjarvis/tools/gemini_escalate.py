@@ -14,7 +14,7 @@ The tool calls the Gemini API and returns either:
   - A detailed implementation plan to include in a github_issue body
 
 Required env var: GEMINI_API_KEY
-Optional env var: GEMINI_MODEL (default: gemini-2.5-flash-preview)
+Optional env var: GEMINI_MODEL (default: gemini-3-flash-preview)
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from openjarvis.tools._stubs import BaseTool, ToolSpec
 log = logging.getLogger("gemini_escalate")
 
 _GEMINI_API = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-_DEFAULT_MODEL = "gemini-2.5-flash-preview"
+_DEFAULT_MODEL = "gemini-3-flash-preview"
 
 # Phrases that indicate Gemini believes code changes are required
 _NEEDS_CODE_PHRASES = [

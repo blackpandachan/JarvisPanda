@@ -2169,6 +2169,69 @@ async def slash_task_log(interaction: discord.Interaction, id: str) -> None:
     await _slash_reply(interaction, _logs)
 
 
+@tree.command(name="help", description="Show all Jarvis commands and capabilities")
+async def slash_help(interaction: discord.Interaction) -> None:
+    lines = [
+        "**Jarvis — command reference**",
+        "",
+        "**Conversation**",
+        "`/ask <query>` — ask anything (local model → Gemini → GitHub issue escalation)",
+        "`/ask-gemini <question>` — bypass local model, ask Gemini 3 Flash directly",
+        "`/agent <task>` — run a one-shot OrchestratorAgent task with full tool access",
+        "",
+        "**Research & Information**",
+        "`/research <topic>` — multi-source deep research, stored to your memory",
+        "`/arxiv <query>` — search recent arXiv papers",
+        "`/papers [topic]` — latest AI/ML arXiv papers",
+        "`/summarize <url>` — fetch and summarise a web page",
+        "`/weather [city]` — current conditions + 3-day forecast",
+        "`/brief` — morning brief: weather + top AI story + daily insight",
+        "`/digest` — on-demand Hacker News AI digest",
+        "",
+        "**Memory**",
+        "`/memory <query>` — search your personal memory store",
+        "",
+        "**GitHub & Code**",
+        "`/propose <idea>` — draft a feature proposal and cut a GitHub issue",
+        "`/build-tool <description>` — spec and propose a new Jarvis tool via GitHub",
+        "`/queue` — show open `claude-code-work` issues queued for Gemini",
+        "`/prs` — list open pull requests",
+        "`/pr <number>` — show PR details and changed files",
+        "`/merge <number>` — squash-merge a PR and delete the branch",
+        "",
+        "**Skills & Tools**",
+        "`/run-skill <name> [args]` — execute a registered Jarvis skill pipeline",
+        "`/skills` — list available skill pipelines",
+        "`/tools` — list all registered agent tools",
+        "",
+        "**Scheduler**",
+        "`/schedule cron|interval <value> <prompt>` — create a recurring background task",
+        "`/tasks` — list all scheduled tasks and their status",
+        "`/pause-task <id>` — pause a task temporarily",
+        "`/resume-task <id>` — resume a paused task",
+        "`/cancel-task <id>` — permanently cancel a task",
+        "`/task-log <id>` — show run history for a task",
+        "",
+        "**System**",
+        "`/status` — engine, model, Gemini/GitHub config, and host stats",
+        "`/health` — on-demand system health check",
+        "",
+        "**Prefix commands** — all of the above also work as `!command` in any channel.",
+        "In <#{CHANNEL_NAME}> just type directly — no prefix needed.".replace("{CHANNEL_NAME}", CHANNEL_NAME),
+        "Mention `@Jarvis <query>` anywhere.",
+        "",
+        "*Three-tier escalation: local qwen3 → Gemini 3 Flash → GitHub issue → Gemini Actions worker → PR*",
+    ]
+    # Split into two messages to stay under 2000 chars
+    full = "\n".join(lines)
+    if len(full) <= 1900:
+        await interaction.response.send_message(full, ephemeral=True)
+    else:
+        mid = len(lines) // 2
+        await interaction.response.send_message("\n".join(lines[:mid]), ephemeral=True)
+        await interaction.followup.send("\n".join(lines[mid:]), ephemeral=True)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
