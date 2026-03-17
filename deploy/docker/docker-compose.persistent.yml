@@ -62,6 +62,20 @@ services:
       WORKSPACE: "/workspace"
     restart: unless-stopped
 
+  # ── Observer agent — health watchdog + arXiv daily + auto-issues ─────────
+  jarvis-observer:
+    build:
+      context: ../..
+      dockerfile: deploy/observer/Dockerfile
+    volumes:
+      - jarvis-data:/data                     # reads traces.db + telemetry.db
+    env_file: ../.env
+    environment:
+      TRACE_DB_PATH:    "/data/traces.db"
+      TELEMETRY_DB_PATH: "/data/telemetry.db"
+    restart: unless-stopped
+    # No extra_hosts needed — only calls external APIs (GitHub, arXiv, Discord)
+
 volumes:
   jarvis-data:       # SQLite memory, telemetry, traces — persists across restarts
   jarvis-reports:    # HN digest markdown reports

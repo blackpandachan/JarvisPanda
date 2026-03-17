@@ -101,4 +101,19 @@ try:
 except ImportError:
     pass
 
+try:
+    import openjarvis.tools.arxiv_search  # noqa: F401
+except ImportError:
+    pass
+
+try:
+    import openjarvis.tools.url_fetch  # noqa: F401
+except ImportError:
+    pass
+
+try:
+    import openjarvis.tools.system_monitor  # noqa: F401
+except ImportError:
+    pass
+
 __all__ = ["BaseTool", "ToolExecutor", "ToolSpec"]
