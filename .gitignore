@@ -77,8 +77,7 @@ docs/plans/
 docs/superpowers/
 .superpowers/
 
-# Claude Code project instructions (per-developer)
-CLAUDE.md
+# Claude Code per-developer settings (not CLAUDE.md — that's shared project context)
 .claude/
 
 # Tauri auto-generated schemas
