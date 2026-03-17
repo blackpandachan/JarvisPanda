@@ -1,0 +1,35 @@
+[skill]
+name = "deep-research"
+description = "Multi-angle research on a topic: memory recall + 3 web searches + synthesis with citations"
+version = "0.1.0"
+author = "jarvis"
+
+[[skill.steps]]
+tool_name = "retrieval"
+arguments_template = '{"query": "{topic}", "top_k": 5}'
+output_key = "memory_context"
+
+[[skill.steps]]
+tool_name = "web_search"
+arguments_template = '{"query": "{topic} overview introduction"}'
+output_key = "search_overview"
+
+[[skill.steps]]
+tool_name = "web_search"
+arguments_template = '{"query": "{topic} latest research 2024 2025"}'
+output_key = "search_recent"
+
+[[skill.steps]]
+tool_name = "web_search"
+arguments_template = '{"query": "{topic} practical applications examples"}'
+output_key = "search_applied"
+
+[[skill.steps]]
+tool_name = "think"
+arguments_template = '{"thought": "Synthesize a comprehensive, well-structured research report on \"{topic}\" from the following sources. Prior knowledge from memory: {memory_context}. Overview: {search_overview}. Recent developments: {search_recent}. Practical applications: {search_applied}. Structure the report as: ## Overview, ## Key Concepts, ## Recent Developments, ## Practical Applications, ## Key Takeaways. Include inline source references where relevant."}'
+output_key = "report"
+
+[[skill.steps]]
+tool_name = "memory_store"
+arguments_template = '{"content": "Deep research on {topic}:\n{report}", "metadata": "deep_research:{topic}"}'
+output_key = "stored"

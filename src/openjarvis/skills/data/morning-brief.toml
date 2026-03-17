@@ -1,0 +1,25 @@
+[skill]
+name = "morning-brief"
+description = "Start-of-day brief: current weather, top AI story, and a thought-provoking insight"
+version = "0.1.0"
+author = "jarvis"
+
+[[skill.steps]]
+tool_name = "weather"
+arguments_template = '{"city": "{city}"}'
+output_key = "weather_now"
+
+[[skill.steps]]
+tool_name = "web_search"
+arguments_template = '{"query": "top AI artificial intelligence news today"}'
+output_key = "ai_news"
+
+[[skill.steps]]
+tool_name = "think"
+arguments_template = '{"thought": "Synthesize a concise morning brief from: Weather: {weather_now}. Top AI news today: {ai_news}. Format as: 1) Weather snapshot (2 sentences), 2) Top AI story (3 sentences), 3) One actionable insight or question to consider today."}'
+output_key = "brief"
+
+[[skill.steps]]
+tool_name = "memory_store"
+arguments_template = '{"content": "Morning brief {date}: {brief}", "metadata": "morning_brief"}'
+output_key = "stored"

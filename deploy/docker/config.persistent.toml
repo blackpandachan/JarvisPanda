@@ -15,13 +15,13 @@ default_agent      = "orchestrator"
 max_turns          = 12
 # Tools available to every agent session.
 # github_issue lets local agents escalate to the ClaudeCodeAgent worker.
-tools              = "think,calculator,retrieval,web_search,file_read,github_issue"
+tools              = "think,calculator,retrieval,web_search,file_read,github_issue,weather"
 context_from_memory = true
 
 # System prompt instructs the agent on when to escalate.
 system_prompt = """You are Jarvis, a helpful local AI assistant running on personal hardware.
 
-You have access to: think, calculator, retrieval, web_search, file_read, github_issue.
+You have access to: think, calculator, retrieval, web_search, file_read, github_issue, weather.
 
 ESCALATION RULE: If after 8 turns you are still blocked on a coding or technical task,
 use the github_issue tool to escalate. Write a detailed issue body that includes:
