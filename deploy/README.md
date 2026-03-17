@@ -111,27 +111,70 @@ ensuring complex tasks eventually get resolved by a capable agent.
 
 ## Discord Commands
 
+### Information & Status
+
 | Command | Description |
 |---|---|
-| `!help` | Full command reference |
-| `!status` | Engine, model, Gemini/GitHub config, host stats |
-| `!tools` | List all registered agent tools |
+| `!help` | Full command reference (auto-generated from registered commands) |
+| `!status` | Local model, Gemini/GitHub config, host CPU/RAM/GPU |
+| `!health` | On-demand health check: system + GitHub queue |
+| `!sysinfo` | Host CPU/RAM/GPU summary |
+| `!sysinfo full` | Detailed per-core + network stats |
+| `!tools` | List all registered agent tools (updates automatically) |
 | `!mcp` | MCP server status |
-| `!skills` | List available Jarvis skills |
+| `!skills` | List available Jarvis skill pipelines |
+
+### Content & Research
+
+| Command | Description |
+|---|---|
+| `!brief` | Morning brief: weather + top AI story + daily insight |
 | `!weather [city]` | Current conditions + 3-day forecast |
-| `!arxiv <query>` | Search recent arXiv papers |
-| `!research <topic>` | Multi-source synthesis, stored to memory |
+| `!research <topic>` | Multi-source synthesis stored to your memory |
 | `!summarize <url>` | Fetch and summarise any web page |
+| `!arxiv <query>` | Search recent arXiv papers |
+| `!papers [topic]` | Latest AI/ML arXiv papers (default: AI/ML) |
 | `!memory <query>` | Search your personal memory store |
 | `!digest now` | On-demand HN AI digest |
-| `!sysinfo` | Host CPU/RAM/GPU stats |
-| `!sysinfo full` | Detailed per-core + network stats |
-| `!propose <idea>` | Draft + submit a feature proposal to GitHub |
+
+### GitHub Workflow
+
+| Command | Description |
+|---|---|
+| `!queue` | Show issue worker queue (all label stages) |
+| `!prs` | List open pull requests with merge commands |
+| `!pr <number>` | PR details: files changed, description, merge command |
+| `!merge <pr#>` | Squash-merge a PR and delete the source branch |
+
+### Agent Workflows
+
+| Command | Description |
+|---|---|
+| `!agent <task>` | Run a one-shot local agent task |
+| `!propose <idea>` | Draft, consult Gemini, and submit a feature proposal |
+| `!build-tool <desc>` | Design, spec, and propose a new Jarvis tool |
+| `!run-skill <name> [args]` | Execute a registered Jarvis skill |
+| `!ask-gemini <question>` | Ask Gemini Flash directly, bypass local model |
 
 Any message in `#jarvis`, `@Jarvis <query>`, or `!ask <query>` triggers a full agent response.
 
-**Reaction approval:** When Jarvis posts a proposal with a GitHub issue URL, react with 👍 to
-add the `claude-code-work` label (queues it for Claude Code), or 👎 to close the issue.
+**Reaction approval:** When Jarvis posts a GitHub issue URL, react 👍 to queue it for
+Claude Code, or 👎 to close the issue.
+
+### Adding New Commands
+
+The bot uses a `CommandRegistry` with decorator-based registration:
+```python
+# In deploy/discord/bot.py — no changes needed to the event loop:
+@cmd.exact("!mycommand", "description shown in !help")
+async def _(message: discord.Message) -> None:
+    await message.channel.send("Hello!")
+
+@cmd.prefix("!mytool ", "!mytool <arg>", "does something with arg")
+async def _(message: discord.Message, arg: str) -> None:
+    reply = await loop.run_in_executor(_executor, do_something, arg)
+    await send_chunked(message.channel, reply)
+```
 
 ---
 
@@ -275,6 +318,43 @@ docker compose -f docker-compose.persistent.yml logs -f
 | `DIGEST_WINDOW_HOURS` | | `72` | Story age cutoff |
 
 ---
+
+## PR Lifecycle & Merge Workflow
+
+When an issue labelled `claude-code-work` is created, the claude-worker:
+
+```
+1. Claims the issue (claude-code-in-progress label)
+2. Creates branch: claude-code/issue-N-slug from main
+3. Runs ClaudeCodeAgent (up to 30 min)
+4. Pushes branch, opens PR linked to the issue
+5. Posts an "Implementation Guide" on BOTH the issue and PR:
+     - Files changed with +/- counts
+     - Commit list
+     - Verification steps (git checkout + pytest)
+     - Merge command: !merge <pr#>
+6. Notifies Discord with PR link and instructions
+7. Labels issue as claude-code-done
+```
+
+**MERGE_STRATEGY options:**
+
+| Strategy | Behaviour |
+|---|---|
+| `manual` (default) | Post PR + guide, wait for `!merge <pr#>` or 👍 reaction |
+| `auto` | Post PR + guide, auto-merge after `MERGE_DELAY_MINUTES` (default 15) if still open |
+| `comment` | Legacy: post agent output as issue comment, no branch/PR |
+
+**Merge via Discord:**
+```
+!prs              → see open PRs
+!pr 42            → see what changed in PR #42
+!merge 42         → squash-merge PR #42 + delete branch
+```
+
+**Merge via local agent:**
+The agent can call `github_merge(pr_number=42)` directly.
+If merge fails (conflicts), the agent escalates to Gemini for a resolution plan.
 
 ## How the Self-Improvement Loop Works
 

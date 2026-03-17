@@ -822,6 +822,352 @@ async def on_message(message: discord.Message) -> None:
     await send_chunked(message.channel, reply)
 
 
+# ── GitHub workflow commands ──────────────────────────────────────────────────
+
+def _gh_api(path: str, method: str = "GET", json: dict | None = None) -> dict | list | None:
+    """Minimal GitHub REST helper — returns parsed JSON or None on error."""
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return None
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/{path}"
+    try:
+        resp = httpx.request(method, url, headers=headers, json=json, timeout=15)
+        if resp.status_code in (200, 201):
+            return resp.json()
+        return {"_error": resp.status_code, "_text": resp.text[:300]}
+    except Exception as exc:
+        return {"_error": str(exc)}
+
+
+@cmd.prefix("!merge ", "!merge <pr#>", "merge a PR (squash + delete branch)")
+async def _(message: discord.Message, arg: str) -> None:
+    if not arg.isdigit():
+        await message.channel.send("Usage: `!merge <pr_number>` — e.g. `!merge 42`")
+        return
+    pr_number = int(arg)
+    loop      = asyncio.get_event_loop()
+
+    def _do_merge() -> str:
+        # Get PR details
+        pr = _gh_api(f"pulls/{pr_number}")
+        if not pr or "_error" in pr:
+            return f"⚠️ Could not fetch PR #{pr_number}: {pr}"
+        state = pr.get("state", "")
+        if state != "open":
+            return f"PR #{pr_number} is `{state}` — nothing to merge."
+        mergeable = pr.get("mergeable")
+        if mergeable is False:
+            return (
+                f"⚠️ PR #{pr_number} has merge conflicts.\n"
+                "Run `!ask-gemini <conflict details>` to get a resolution plan."
+            )
+        title    = pr.get("title", "")
+        head_ref = pr.get("head", {}).get("ref", "")
+        pr_url   = pr.get("html_url", "")
+
+        merge_data = _gh_api(
+            f"pulls/{pr_number}/merge",
+            method="PUT",
+            json={"merge_method": "squash", "commit_title": f"[JarvisPanda] {title} (#{pr_number})"},
+        )
+        if merge_data and "_error" not in merge_data:
+            sha = (merge_data.get("sha") or "")[:8]
+            # Delete branch
+            if head_ref:
+                _gh_api(f"git/refs/heads/{head_ref}", method="DELETE")
+            return f"✅ PR #{pr_number} merged (squash) → `{sha}`\n{pr_url}\nBranch `{head_ref}` deleted."
+        return f"⚠️ Merge failed: {merge_data}"
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(_executor, _do_merge)
+    await send_chunked(message.channel, reply)
+
+
+@cmd.exact("!prs", "list open pull requests")
+async def _(message: discord.Message) -> None:
+    loop = asyncio.get_event_loop()
+
+    def _prs() -> str:
+        data = _gh_api("pulls?state=open&per_page=15")
+        if not data or "_error" in data:
+            return f"⚠️ Could not fetch PRs: {data}"
+        if not data:
+            return "No open pull requests."
+        lines = ["**Open Pull Requests**"]
+        for pr in data:
+            n     = pr["number"]
+            title = pr["title"][:60]
+            url   = pr["html_url"]
+            user  = pr.get("user", {}).get("login", "?")
+            lines.append(f"• **[#{n}]({url})** {title} — `{user}`  →  `!merge {n}`")
+        return "\n".join(lines)
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(_executor, _prs)
+    await send_chunked(message.channel, reply)
+
+
+@cmd.exact("!queue", "show claude-code-work issue queue")
+async def _(message: discord.Message) -> None:
+    loop = asyncio.get_event_loop()
+
+    def _queue() -> str:
+        if not GITHUB_TOKEN or not GITHUB_REPO:
+            return "⚠️ GITHUB_TOKEN / GITHUB_REPO not configured."
+        lines = ["**Issue Worker Queue**"]
+        for label, emoji in [
+            ("claude-code-work",        "📥 queued"),
+            ("claude-code-in-progress", "⚙️ in progress"),
+            ("claude-code-done",        "✅ done (unmerged)"),
+            ("claude-code-failed",      "❌ failed"),
+        ]:
+            data = _gh_api(f"issues?labels={label}&state=open&per_page=10")
+            if not data or "_error" in data:
+                lines.append(f"{emoji}: (error fetching)")
+                continue
+            if not data:
+                lines.append(f"{emoji}: none")
+            else:
+                for issue in data[:5]:
+                    n     = issue["number"]
+                    title = issue["title"][:55]
+                    url   = issue["html_url"]
+                    lines.append(f"{emoji}: **[#{n}]({url})** {title}")
+        return "\n".join(lines)
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(_executor, _queue)
+    await send_chunked(message.channel, reply)
+
+
+@cmd.prefix("!pr ", "!pr <number>", "show PR details and what changed")
+async def _(message: discord.Message, arg: str) -> None:
+    if not arg.isdigit():
+        await message.channel.send("Usage: `!pr <pr_number>`")
+        return
+    pr_number = int(arg)
+    loop      = asyncio.get_event_loop()
+
+    def _pr_detail() -> str:
+        pr = _gh_api(f"pulls/{pr_number}")
+        if not pr or "_error" in pr:
+            return f"⚠️ Could not fetch PR #{pr_number}"
+        title  = pr.get("title", "")
+        state  = pr.get("state", "")
+        url    = pr.get("html_url", "")
+        body   = (pr.get("body") or "")[:600]
+        branch = pr.get("head", {}).get("ref", "")
+        user   = pr.get("user", {}).get("login", "?")
+        files  = _gh_api(f"pulls/{pr_number}/files?per_page=20")
+        file_lines = []
+        if files and "_error" not in files:
+            for f in files[:15]:
+                fname = f.get("filename", "")
+                status = f.get("status", "")
+                adds  = f.get("additions", 0)
+                dels  = f.get("deletions", 0)
+                file_lines.append(f"  `{fname}` ({status} +{adds}/-{dels})")
+        files_str = "\n".join(file_lines) or "  _(no file data)_"
+        return (
+            f"**PR #{pr_number}** — `{state}`\n"
+            f"**{title}**\n{url}\n"
+            f"Author: `{user}` · Branch: `{branch}`\n\n"
+            f"**Files changed:**\n{files_str}\n\n"
+            f"**Description:**\n{body}\n\n"
+            f"Merge: `!merge {pr_number}`"
+        )
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(_executor, _pr_detail)
+    await reply_long(message, reply, f"PR #{pr_number}")
+
+
+# ── Content & research commands ───────────────────────────────────────────────
+
+@cmd.exact("!brief", "morning brief: weather + AI news + insight")
+async def _(message: discord.Message) -> None:
+    user_id      = message.author.id
+    display_name = message.author.display_name
+    loop         = asyncio.get_event_loop()
+
+    def _brief() -> str:
+        city = DEFAULT_CITY or "New York"
+        weather = _call_tool("weather", city=city) or ""
+        return _run_ask(
+            f"Give me a concise morning brief with three sections:\n"
+            f"1. **Weather** — summarise this in 1-2 sentences: {weather[:300]}\n"
+            f"2. **Top AI Story** — use web_search to find the most-discussed AI news today, "
+            f"summarise in 3 sentences.\n"
+            f"3. **Insight** — one thought-provoking question or insight relevant to AI/tech "
+            f"I should think about today.\n\n"
+            f"Keep it concise and useful.",
+            user_id, display_name,
+        )
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(_executor, _brief)
+    await reply_long(message, reply, "Morning Brief")
+
+
+@cmd.prefix("!papers", "!papers [topic]", "latest arXiv AI/ML papers (or custom topic)")
+async def _(message: discord.Message, topic: str) -> None:
+    query = topic or "LLM AI agent reasoning alignment"
+    loop  = asyncio.get_event_loop()
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(
+            _executor,
+            lambda: _call_tool("arxiv_search", query=query, max_results=8, sort_by="submittedDate")
+                    or _run_ask(f"Find the latest arXiv papers on: {query}"),
+        )
+    await reply_long(message, reply, f"arXiv: {query[:50]}")
+
+
+@cmd.prefix("!ask-gemini ", "!ask-gemini <question>", "ask Gemini Flash directly")
+async def _(message: discord.Message, question: str) -> None:
+    if not question:
+        await message.channel.send("Usage: `!ask-gemini <question>`")
+        return
+    loop = asyncio.get_event_loop()
+
+    def _gemini() -> str:
+        api_key = os.environ.get("GEMINI_API_KEY", "")
+        if not api_key:
+            return "⚠️ GEMINI_API_KEY is not configured."
+        try:
+            from openjarvis.tools.gemini_escalate import gemini_generate
+            resp = gemini_generate(question)
+            return f"**Gemini Flash** says:\n\n{resp}"
+        except Exception as exc:
+            return f"⚠️ Gemini call failed: {exc}"
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(_executor, _gemini)
+    await reply_long(message, reply, f"Gemini: {question[:50]}")
+
+
+# ── Agent workflow commands ───────────────────────────────────────────────────
+
+@cmd.prefix("!agent ", "!agent <task>", "run a one-shot local agent task")
+async def _(message: discord.Message, task: str) -> None:
+    if not task:
+        await message.channel.send("Usage: `!agent <what you want the agent to do>`")
+        return
+    user_id      = message.author.id
+    display_name = message.author.display_name
+    loop         = asyncio.get_event_loop()
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(
+            _executor, _run_ask, task, user_id, display_name, ""
+        )
+    await reply_long(message, reply, f"Agent: {task[:50]}")
+
+
+@cmd.prefix("!build-tool ", "!build-tool <description>", "spec, plan, and propose a new Jarvis tool")
+async def _(message: discord.Message, description: str) -> None:
+    if not description:
+        await message.channel.send("Usage: `!build-tool <what the tool should do>`")
+        return
+    user_id      = message.author.id
+    display_name = message.author.display_name
+
+    await message.channel.send(
+        f"Designing tool: _{description}_\n"
+        "Consulting Gemini for a spec, then opening a GitHub issue…\n"
+        "React **👍** to queue for Claude Code, **👎** to withdraw."
+    )
+    loop = asyncio.get_event_loop()
+
+    def _build() -> str:
+        return _run_ask(
+            f"A user wants to build a new OpenJarvis tool:\n\n```\n{description}\n```\n\n"
+            "Steps:\n"
+            "1. Use gemini_escalate(mode=plan) to design a complete tool spec including:\n"
+            "   - Tool name (snake_case)\n"
+            "   - What it does and why it's useful\n"
+            "   - Parameters schema (JSON Schema)\n"
+            "   - Implementation approach (API used, dependencies)\n"
+            "   - Example usage\n"
+            "   - How it fits into the escalation chain\n"
+            "2. Use github_issue to create an issue with:\n"
+            "   - Title: 'feat: add {tool_name} tool'\n"
+            "   - Body: Gemini's full spec + implementation plan\n"
+            "   - The tool should follow BaseTool / ToolSpec patterns from existing tools\n"
+            "3. Return the issue URL so the user can approve or withdraw it.\n\n"
+            "Reference implementation: src/openjarvis/tools/weather.py is a clean example.",
+            user_id, display_name,
+        )
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(_executor, _build)
+    await send_chunked(message.channel, reply)
+
+
+@cmd.prefix("!run-skill ", "!run-skill <name> [args]", "execute a registered Jarvis skill")
+async def _(message: discord.Message, arg: str) -> None:
+    if not arg:
+        await message.channel.send(
+            "Usage: `!run-skill <skill-name> [key=value ...]`\n"
+            "Run `!skills` to see available skills."
+        )
+        return
+    # Parse: first word is skill name, rest are args
+    parts      = arg.split(None, 1)
+    skill_name = parts[0]
+    skill_args = parts[1] if len(parts) > 1 else ""
+    user_id      = message.author.id
+    display_name = message.author.display_name
+    loop         = asyncio.get_event_loop()
+
+    def _skill() -> str:
+        return _run_ask(
+            f"Run the Jarvis skill named '{skill_name}'"
+            + (f" with these parameters: {skill_args}" if skill_args else "")
+            + ".\n\nIf the skill requires parameters not provided, use sensible defaults "
+            "or ask the user what they want. Report the result clearly.",
+            user_id, display_name,
+        )
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(_executor, _skill)
+    await reply_long(message, reply, f"Skill: {skill_name}")
+
+
+@cmd.exact("!health", "on-demand system health check (same as observer)")
+async def _(message: discord.Message) -> None:
+    loop = asyncio.get_event_loop()
+
+    def _health() -> str:
+        lines = ["**On-demand Health Check**"]
+        # System
+        sys_info = _call_tool("system_monitor", detail="summary")
+        if sys_info:
+            lines.append(sys_info)
+        # GitHub queue summary
+        if GITHUB_TOKEN and GITHUB_REPO:
+            for label, emoji in [
+                ("claude-code-work", "📥 queued"),
+                ("claude-code-in-progress", "⚙️ in progress"),
+                ("claude-code-done", "✅ done (unmerged)"),
+            ]:
+                data = _gh_api(f"issues?labels={label}&state=open&per_page=5")
+                count = len(data) if isinstance(data, list) else 0
+                lines.append(f"{emoji}: {count}")
+            prs = _gh_api("pulls?state=open&per_page=5")
+            pr_count = len(prs) if isinstance(prs, list) else 0
+            lines.append(f"🔀 open PRs: {pr_count}")
+        return "\n".join(lines)
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(_executor, _health)
+    await send_chunked(message.channel, reply)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

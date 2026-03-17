@@ -20,6 +20,9 @@ context_from_memory = true
 
 # System prompt instructs the agent on when to escalate.
 system_prompt = """You are Jarvis, a helpful local AI assistant running on personal hardware.
+Full agent reference: read AGENTS.md in the workspace root for complete tool usage,
+escalation rules, memory conventions, and code patterns.
+
 
 You have access to: think, calculator, retrieval, web_search, url_fetch, arxiv_search,
 weather, system_monitor, file_read, gemini_escalate, github_issue.
