@@ -80,7 +80,10 @@ class ClaudeCodeAgent(BaseAgent):
 
     def _ensure_runner(self) -> Path:
         """Copy the bundled runner to ``~/.openjarvis/claude_code_runner/``
-        and run ``npm install`` if ``node_modules`` is missing.
+        and run ``npm install --production`` if ``node_modules`` is missing.
+
+        ``dist/index.js`` is a pre-compiled ES module committed to the repo —
+        no TypeScript build step is required.
 
         Returns the path to the runner directory.
 
@@ -95,7 +98,9 @@ class ClaudeCodeAgent(BaseAgent):
         dest = Path.home() / ".openjarvis" / "claude_code_runner"
         dest.mkdir(parents=True, exist_ok=True)
 
-        # Copy runner files if missing or outdated
+        # Copy runner files if missing or outdated.
+        # dist/index.js is a pre-compiled ES module committed to the repo —
+        # no TypeScript build step needed at runtime.
         for sub in ("package.json", "dist"):
             src = _RUNNER_SRC / sub
             dst = dest / sub
@@ -116,6 +121,14 @@ class ClaudeCodeAgent(BaseAgent):
                 check=True,
                 capture_output=True,
                 timeout=120,
+            )
+
+        # Verify the runner entry point exists
+        dist_entry = dest / "dist" / "index.js"
+        if not dist_entry.exists():
+            raise RuntimeError(
+                f"claude_code_runner entry point not found at {dist_entry}. "
+                "The dist/index.js file should be pre-compiled and included in the package."
             )
 
         return dest

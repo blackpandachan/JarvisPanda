@@ -78,6 +78,7 @@ async function main(): Promise<void> {
   } catch (err) {
     emitError(`Failed to parse input: ${err}`);
     process.exit(1);
+    return; // unreachable — tells TypeScript that request is always assigned below
   }
 
   // Set the API key in the environment for the SDK

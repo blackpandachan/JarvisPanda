@@ -1,24 +1,12 @@
-# Claude Code Issue Worker — Python 3.12 + Node.js 22 (via NodeSource)
+# Jarvis Claude Code Label Manager
+# Ensures claude-code-* labels exist and optionally receives GitHub webhooks.
+# AI implementation work is handled by GitHub Actions (claude-issue-worker.yml).
 
 FROM python:3.12-slim
 
-# Install Node.js 22 LTS from NodeSource (proper install, not binary copy)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates && \
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y --no-install-recommends nodejs && \
-    rm -rf /var/lib/apt/lists/* && \
-    node --version && npm --version
+# httpx only — no Node.js, no Claude CLI needed
+RUN pip install --no-cache-dir httpx
 
-# Install OpenJarvis from source
-WORKDIR /app
-COPY pyproject.toml README.md ./
-COPY src/ src/
-
-RUN pip install --no-cache-dir uv && \
-    uv pip install --system "."
-
-# Copy worker script
 COPY deploy/claude-worker/worker.py /worker.py
 
 CMD ["python", "/worker.py"]

@@ -1,42 +1,29 @@
-"""Jarvis Claude Code Issue Worker.
+"""Jarvis Claude Code Label Manager / Webhook Receiver.
 
-Polls GitHub for issues labelled ``claude-code-work``, claims them, runs
-the ClaudeCodeAgent, then depending on MERGE_STRATEGY:
+Ensures the claude-code-* GitHub labels exist and optionally receives GitHub
+webhooks so the poll loop wakes immediately on label events.
 
-  manual (default) — push branch + open PR, post implementation guide on both
-                     the PR and the original issue, notify Discord with merge
-                     instructions.  Human or local agent merges via !merge <pr>.
+The actual AI implementation work is done by the GitHub Actions workflow
+``.github/workflows/claude-issue-worker.yml``, which triggers on the
+``claude-code-work`` label via the Claude Code GitHub App (subscription OAuth —
+no ANTHROPIC_API_KEY required).
 
-  auto             — same as manual, but auto-merges after MERGE_DELAY_MINUTES
-                     if no one has closed or declined the PR.
-
-  comment          — legacy: post agent output as issue comment, no branch/PR.
-
-After a PR is created the worker posts a structured implementation guide that
-tells local agents exactly how to verify and merge the work.  If the local
-agent encounters problems merging, it can escalate via gemini_escalate or cut
-a follow-up issue.
-
-Label lifecycle:
+Label lifecycle (managed by GitHub Actions):
   claude-code-work        → queued (created by local qwen3 or Discord !propose)
-  claude-code-in-progress → worker claimed it
-  claude-code-done        → PR opened (or comment posted); awaiting merge/review
-  claude-code-failed      → worker errored; issue stays open for manual triage
+  claude-code-in-progress → GH Actions claimed it
+  claude-code-done        → PR opened; awaiting merge/review
+  claude-code-failed      → Actions errored; issue stays open for manual triage
 
 Required env vars:
   GITHUB_TOKEN       PAT with repo scope (read + write issues + PRs)
   GITHUB_REPO        owner/repo
-  ANTHROPIC_API_KEY  For ClaudeCodeAgent
 
 Optional env vars:
-  WORKSPACE           Repo path inside container (default /workspace)
-  POLL_INTERVAL       Seconds between polls (default 300)
-  MAX_ISSUE_AGE_DAYS  Skip stale issues (default 14)
-  WORKER_LABEL_WORK   Override work label (default claude-code-work)
-  MERGE_STRATEGY      manual | auto | comment (default manual)
-  MERGE_DELAY_MINUTES Minutes to wait before auto-merge (default 15, auto only)
-  DISCORD_DIGEST_WEBHOOK  Webhook for PR-ready notifications
-  DEFAULT_BRANCH      Base branch to create PRs against (default main)
+  POLL_INTERVAL          Seconds between label-check polls (default 300)
+  WORKER_LABEL_WORK      Override work label (default claude-code-work)
+  DISCORD_DIGEST_WEBHOOK Webhook for notifications
+  GITHUB_WEBHOOK_SECRET  HMAC secret for webhook receiver
+  GITHUB_WEBHOOK_PORT    Webhook listener port (default 9000)
 """
 
 from __future__ import annotations
@@ -64,16 +51,11 @@ log = logging.getLogger("claude-worker")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-GITHUB_TOKEN: str      = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_REPO: str       = os.environ.get("GITHUB_REPO", "")
-ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
-WORKSPACE: str         = os.environ.get("WORKSPACE", "/workspace")
-POLL_INTERVAL: int     = int(os.environ.get("POLL_INTERVAL", "300"))
-MAX_ISSUE_AGE_DAYS: int = int(os.environ.get("MAX_ISSUE_AGE_DAYS", "14"))
-MERGE_STRATEGY: str    = os.environ.get("MERGE_STRATEGY", "manual")  # manual|auto|comment
-MERGE_DELAY: int       = int(os.environ.get("MERGE_DELAY_MINUTES", "15")) * 60
-DISCORD_WEBHOOK: str   = os.environ.get("DISCORD_DIGEST_WEBHOOK", "")
-DEFAULT_BRANCH: str    = os.environ.get("DEFAULT_BRANCH", "main")
+GITHUB_TOKEN: str  = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO: str   = os.environ.get("GITHUB_REPO", "")
+POLL_INTERVAL: int = int(os.environ.get("POLL_INTERVAL", "300"))
+DISCORD_WEBHOOK: str = os.environ.get("DISCORD_DIGEST_WEBHOOK", "")
+DEFAULT_BRANCH: str  = os.environ.get("DEFAULT_BRANCH", "main")
 
 LABEL_WORK   = os.environ.get("WORKER_LABEL_WORK", "claude-code-work")
 LABEL_WIP    = "claude-code-in-progress"
@@ -189,7 +171,7 @@ def merge_pr(pr_number: int, method: str = "squash") -> tuple[bool, str]:
             f"{GITHUB_API}/repos/{GITHUB_REPO}/pulls/{pr_number}/merge",
             json={
                 "merge_method": method,
-                "commit_title": f"Auto-merge PR #{pr_number} (ClaudeCodeAgent)",
+                "commit_title": f"Auto-merge PR #{pr_number} (Claude Code)",
             },
         )
     if r.status_code == 200:
@@ -285,7 +267,7 @@ def create_pr(issue_number: int, title: str, branch: str, agent_summary: str) ->
         f"## Agent Summary\n\n{agent_summary[:3000]}\n\n"
         f"---\n"
         f"*Implemented by [JarvisPanda](https://github.com/blackpandachan/JarvisPanda) "
-        f"ClaudeCodeAgent (`claude-opus-4-6`). Review the changes, then merge with "
+        f"Claude Code (`claude-opus-4-6`). Review the changes, then merge with "
         f"`!merge {'{pr_number}'}` in Discord or via GitHub UI.*"
     )
     with _gh() as http:
@@ -370,7 +352,7 @@ uv run pytest tests/ -v
 2. The agent will consult Gemini and open a new issue with a fix plan
 
 ---
-*Implemented autonomously by ClaudeCodeAgent · [JarvisPanda](https://github.com/blackpandachan/JarvisPanda)*"""
+*Implemented autonomously by Claude Code · [JarvisPanda](https://github.com/blackpandachan/JarvisPanda)*"""
 
     # Post on the original issue
     post_comment(issue_number, guide)
@@ -398,14 +380,14 @@ def notify_discord_pr(
             "title": f"🤖 PR Ready — Issue #{issue_number}",
             "description": (
                 f"**{issue_title}**\n\n"
-                f"ClaudeCodeAgent has implemented this issue and opened a PR.\n\n"
+                f"Claude Code has implemented this issue and opened a PR.\n\n"
                 f"**PR:** [{pr_url}]({pr_url})\n"
                 f"**Branch:** `{branch}`\n\n"
                 f"{merge_note}\n\n"
                 f"Implementation guide posted on the issue and PR."
             ),
             "color": 0x10B981,
-            "footer": {"text": f"JarvisPanda ClaudeCodeAgent · {MERGE_STRATEGY} merge strategy"},
+            "footer": {"text": f"JarvisPanda Claude Code · {MERGE_STRATEGY} merge strategy"},
         }]
     }
     try:
@@ -426,7 +408,7 @@ def notify_discord_merged(pr_number: int, pr_url: str) -> None:
     except Exception:
         pass
 
-# ── ClaudeCodeAgent runner ────────────────────────────────────────────────────
+# ── Claude Code runner ────────────────────────────────────────────────────
 
 def build_task_prompt(issue: dict) -> str:
     number = issue["number"]
@@ -466,27 +448,47 @@ def build_task_prompt(issue: dict) -> str:
 """
 
 
+def _drop_to_worker() -> None:
+    """Drop root privileges for the claude subprocess (claude CLI refuses to run as root)."""
+    import pwd
+    try:
+        pw = pwd.getpwnam("worker")
+        os.setgroups([])
+        os.setgid(pw.pw_gid)
+        os.setuid(pw.pw_uid)
+    except (KeyError, PermissionError):
+        pass  # not root, or user doesn't exist — proceed anyway
+
+
 def run_claude_code_agent(task_prompt: str, issue_number: int) -> tuple[bool, str]:
+    """Run Claude Code CLI directly on the issue task.
+    Drops to non-root user since claude CLI refuses --dangerously-skip-permissions as root.
+    """
     if not ANTHROPIC_API_KEY:
         return False, "ANTHROPIC_API_KEY is not set."
 
-    log.info("Running ClaudeCodeAgent for issue #%d...", issue_number)
+    log.info("Running Claude Code CLI for issue #%d...", issue_number)
+    env = {**os.environ, "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY, "HOME": "/home/worker"}
     try:
         result = subprocess.run(
-            ["jarvis", "ask", "--agent", "claude_code", "--no-context", task_prompt],
+            ["claude", "--dangerously-skip-permissions", "-p", task_prompt],
             capture_output=True, text=True, cwd=WORKSPACE, timeout=1800,
-            env={**os.environ, "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY},
+            env=env, preexec_fn=_drop_to_worker,
         )
         output  = ((result.stdout or "") + (result.stderr or "")).strip()
         success = result.returncode == 0
         if not success:
-            log.warning("ClaudeCodeAgent exited %d for #%d", result.returncode, issue_number)
+            log.warning("Claude Code CLI exited %d for #%d", result.returncode, issue_number)
         return success, output
     except subprocess.TimeoutExpired:
-        log.error("ClaudeCodeAgent timed out on issue #%d", issue_number)
-        return False, "ClaudeCodeAgent exceeded the 30-minute time limit."
+        log.error("Claude Code CLI timed out on issue #%d", issue_number)
+        return False, "Claude Code exceeded the 30-minute time limit."
+    except FileNotFoundError:
+        return False, (
+            "claude CLI not found. Ensure @anthropic-ai/claude-code is installed globally."
+        )
     except Exception as exc:
-        log.exception("Unexpected error running ClaudeCodeAgent for #%d", issue_number)
+        log.exception("Unexpected error running Claude Code for #%d", issue_number)
         return False, f"Unexpected error: {exc}"
 
 
@@ -496,7 +498,7 @@ def format_failure_comment(output: str, elapsed: float) -> str:
     if len(output) > 10_000:
         output = output[:10_000] + "\n\n_(output truncated)_"
     return (
-        f"❌ **ClaudeCodeAgent failed** — {minutes}m {seconds}s\n\n"
+        f"❌ **Claude Code failed** — {minutes}m {seconds}s\n\n"
         f"<details><summary>Agent output</summary>\n\n```\n{output}\n```\n\n</details>\n\n"
         f"---\n"
         f"**Next steps for local agents:**\n"
@@ -504,7 +506,7 @@ def format_failure_comment(output: str, elapsed: float) -> str:
         f"2. Use `gemini_escalate` with the full error context to get a fix plan.\n"
         f"3. If Gemini can solve it, implement the fix and push to a branch manually.\n"
         f"4. If not, cut a new issue with the combined error + Gemini analysis.\n\n"
-        f"*[JarvisPanda](https://github.com/blackpandachan/JarvisPanda) ClaudeCodeAgent*"
+        f"*[JarvisPanda](https://github.com/blackpandachan/JarvisPanda) Claude Code*"
     )
 
 # ── Main processing ───────────────────────────────────────────────────────────
@@ -522,7 +524,7 @@ def process_issue(issue: dict) -> None:
         success, output = run_claude_code_agent(build_task_prompt(issue), number)
         elapsed        = time.monotonic() - start
         post_comment(number, format_failure_comment(output, elapsed) if not success else
-                     f"✅ **ClaudeCodeAgent completed** — {int(elapsed//60)}m {int(elapsed%60)}s\n\n{output[:5000]}")
+                     f"✅ **Claude Code completed** — {int(elapsed//60)}m {int(elapsed%60)}s\n\n{output[:5000]}")
         set_labels(number, add=[LABEL_DONE if success else LABEL_FAILED], remove=[LABEL_WIP])
         return
 
@@ -546,7 +548,7 @@ def process_issue(issue: dict) -> None:
     # Push branch
     if branch and not push_branch(branch):
         post_comment(number,
-            "⚠️ ClaudeCodeAgent completed but `git push` failed. "
+            "⚠️ Claude Code completed but `git push` failed. "
             "Check worker logs. The implementation may exist as uncommitted local changes."
         )
         set_labels(number, add=[LABEL_FAILED], remove=[LABEL_WIP])
@@ -668,11 +670,6 @@ def validate_config() -> bool:
     if not GITHUB_REPO:
         log.error("GITHUB_REPO is not set")
         ok = False
-    if not ANTHROPIC_API_KEY:
-        log.warning("ANTHROPIC_API_KEY not set — worker will poll but cannot run ClaudeCodeAgent.")
-    if MERGE_STRATEGY not in ("manual", "auto", "comment"):
-        log.error("MERGE_STRATEGY must be manual, auto, or comment (got %r)", MERGE_STRATEGY)
-        ok = False
     return ok
 
 
@@ -681,29 +678,24 @@ def main() -> None:
         sys.exit(1)
 
     log.info(
-        "Claude Code Worker starting — repo: %s | poll: %ds | strategy: %s",
-        GITHUB_REPO, POLL_INTERVAL, MERGE_STRATEGY,
+        "Claude Code Label Manager starting — repo: %s | poll: %ds | "
+        "AI work handled by GitHub Actions (claude-issue-worker.yml)",
+        GITHUB_REPO, POLL_INTERVAL,
     )
     ensure_labels()
     _start_webhook_server()
 
+    # Poll just to keep labels healthy. GitHub Actions does the actual AI work.
     while True:
         try:
-            issues = get_queued_issues()
-            if issues:
-                log.info("Found %d queued issue(s)", len(issues))
-                for issue in issues:
-                    process_issue(issue)
-            else:
-                log.debug("No queued issues")
+            ensure_labels()
         except httpx.HTTPStatusError as exc:
             log.error("GitHub API error: %s", exc)
         except Exception as exc:
             log.exception("Main loop error: %s", exc)
 
-        # Wait for next poll, but wake immediately if a webhook fires
         _wake_event.clear()
-        log.debug("Sleeping up to %ds (wake on webhook)...", POLL_INTERVAL)
+        log.debug("Sleeping %ds...", POLL_INTERVAL)
         _wake_event.wait(timeout=POLL_INTERVAL)
 
 

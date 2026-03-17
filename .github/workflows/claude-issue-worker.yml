@@ -1,0 +1,77 @@
+name: Claude Code Issue Worker
+
+# Triggered when a local agent labels an issue `claude-code-work`.
+# Posts an @claude mention — the installed Claude Code GitHub App picks it up,
+# implements the fix via subscription OAuth (no ANTHROPIC_API_KEY needed),
+# and opens a PR. Discord is notified when the label is set.
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  trigger-claude:
+    if: github.event.label.name == 'claude-code-work'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: Ask Claude Code to implement the fix
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const body = `@claude
+
+            A local Jarvis agent (qwen3/Ollama tier) has escalated this issue because it could not solve it autonomously. Please implement the fix.
+
+            **Your task:**
+            1. Read the issue description carefully and understand the root cause.
+            2. Explore the relevant code in the repository.
+            3. Implement a complete solution (code, tests, config — whatever is needed).
+            4. Run any relevant tests if available.
+            5. Open a pull request referencing \`fixes #${issue.number}\` in the description.
+            6. Use Conventional Commits format (\`fix:\`, \`feat:\`, etc.).
+
+            **Codebase context:**
+            - This is JarvisPanda — a personal autonomous AI stack built on OpenJarvis.
+            - Python package lives in \`src/openjarvis/\`.
+            - Run tests with: \`uv run pytest tests/ -v\`
+            - Lint with: \`uv run ruff check src/ tests/\`
+            - See \`CLAUDE.md\` for full architecture details.
+
+            When the PR is ready, local agents will pick up the Discord notification and verify/merge it.`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body: body,
+            });
+
+      - name: Notify Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_DIGEST_WEBHOOK }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK" ]; then
+            echo "No DISCORD_DIGEST_WEBHOOK secret set — skipping notification"
+            exit 0
+          fi
+
+          # Escape for JSON
+          SAFE_TITLE=$(echo "$ISSUE_TITLE" | sed 's/"/\\"/g')
+
+          curl -sf -X POST "$DISCORD_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"embeds\": [{
+                \"title\": \"🤖 Claude Code picked up issue #${ISSUE_NUMBER}\",
+                \"description\": \"**${SAFE_TITLE}**\\n\\nLocal agents couldn't solve this — Claude Code is implementing a fix. A PR will appear shortly.\",
+                \"url\": \"${ISSUE_URL}\",
+                \"color\": 16776960
+              }]
+            }"

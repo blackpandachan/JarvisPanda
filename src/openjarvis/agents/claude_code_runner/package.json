@@ -1,8 +1,17 @@
 {
   "name": "openjarvis-claude-code-runner",
   "version": "0.1.0",
+  "type": "module",
   "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc"
+  },
   "dependencies": {
     "@anthropic-ai/claude-code": "^0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0",
+    "typescript": "^5.0"
   }
 }
+
