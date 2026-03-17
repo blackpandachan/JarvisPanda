@@ -1,0 +1,9 @@
+services:
+  jarvis:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.dev
+    volumes:
+      - ./config.dev.toml:/root/.openjarvis/config.toml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

@@ -1,0 +1,94 @@
+# OpenJarvis — persistent local config
+# Engine: Ollama on host | Agent: orchestrator | Memory: SQLite (persistent)
+
+# ── Intelligence ────────────────────────────────────────────────────────────
+[intelligence]
+default_model   = "qwen3:8b"
+preferred_engine = "ollama"
+temperature      = 0.7
+max_tokens       = 2048
+top_p            = 0.9
+
+# ── Agent ───────────────────────────────────────────────────────────────────
+[agent]
+default_agent      = "orchestrator"
+max_turns          = 12
+# Tools available to every agent session.
+# github_issue lets local agents escalate to the ClaudeCodeAgent worker.
+tools              = "think,calculator,retrieval,web_search,file_read,github_issue"
+context_from_memory = true
+
+# System prompt instructs the agent on when to escalate.
+system_prompt = """You are Jarvis, a helpful local AI assistant running on personal hardware.
+
+You have access to: think, calculator, retrieval, web_search, file_read, github_issue.
+
+ESCALATION RULE: If after 8 turns you are still blocked on a coding or technical task,
+use the github_issue tool to escalate. Write a detailed issue body that includes:
+  1. The original task description
+  2. Every approach you tried and why it failed
+  3. The specific blocker (error message, missing knowledge, etc.)
+  4. Relevant file paths, code snippets, or partial output
+  5. Suggested next steps for the worker
+
+Do NOT escalate for general knowledge questions or conversational tasks.
+"""
+
+# ── Engine ───────────────────────────────────────────────────────────────────
+[engine]
+default = "ollama"
+
+[engine.ollama]
+host = "http://host.docker.internal:11434"
+
+[engine.vllm]
+host = "http://host.docker.internal:8001"
+
+[engine.cloud]
+# Activated when ANTHROPIC_API_KEY or OPENAI_API_KEY is set in environment.
+provider = "anthropic"
+
+# ── Memory / Storage ────────────────────────────────────────────────────────
+[tools.storage]
+default_backend = "sqlite"
+db_path         = "/data/memory.db"
+
+[memory]
+default_backend    = "sqlite"
+db_path            = "/data/memory.db"
+context_top_k      = 5
+context_min_score  = 0.3
+context_max_tokens = 1500
+
+# ── MCP ──────────────────────────────────────────────────────────────────────
+[tools.mcp]
+enabled = true
+
+# ── Telemetry ────────────────────────────────────────────────────────────────
+[telemetry]
+enabled              = true
+db_path              = "/data/telemetry.db"
+gpu_metrics          = false   # set true if pynvml is available in container
+gpu_poll_interval_ms = 100
+
+# ── Traces ───────────────────────────────────────────────────────────────────
+[traces]
+enabled = true
+db_path = "/data/traces.db"
+
+# ── Server ───────────────────────────────────────────────────────────────────
+[server]
+host  = "0.0.0.0"
+port  = 8000
+agent = "orchestrator"
+
+# ── Security ─────────────────────────────────────────────────────────────────
+[security]
+enabled = false
+
+# ── Learning ─────────────────────────────────────────────────────────────────
+[learning]
+enabled = false
+
+[learning.routing]
+policy = "heuristic"

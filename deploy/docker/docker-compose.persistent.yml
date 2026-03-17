@@ -1,0 +1,70 @@
+services:
+
+  # ── Jarvis core API server ──────────────────────────────────────────────────
+  jarvis-server:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.dev
+    command: ["serve", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config.persistent.toml:/root/.openjarvis/config.toml:ro
+      - jarvis-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file: ../.env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ── Discord bot ─────────────────────────────────────────────────────────────
+  jarvis-discord:
+    build:
+      context: ../discord
+      dockerfile: Dockerfile
+    depends_on:
+      jarvis-server:
+        condition: service_healthy
+    env_file: ../.env
+    environment:
+      JARVIS_URL: "http://jarvis-server:8000"
+    restart: unless-stopped
+
+  # ── HN AI digest scheduler ──────────────────────────────────────────────────
+  jarvis-digest:
+    build:
+      context: ../digest
+      dockerfile: Dockerfile
+    volumes:
+      - jarvis-reports:/reports
+    env_file: ../.env
+    environment:
+      JARVIS_URL: "http://jarvis-server:8000"
+    restart: unless-stopped
+
+  # ── Claude Code issue worker ────────────────────────────────────────────────
+  jarvis-claude-worker:
+    build:
+      context: ../..
+      dockerfile: deploy/claude-worker/Dockerfile
+    volumes:
+      - ./config.persistent.toml:/root/.openjarvis/config.toml:ro
+      - jarvis-data:/data
+      # Mount the repo so ClaudeCodeAgent has a workspace to read/write
+      - ../..:/workspace
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file: ../.env
+    environment:
+      WORKSPACE: "/workspace"
+      JARVIS_URL: "http://jarvis-server:8000"
+    restart: unless-stopped
+
+volumes:
+  jarvis-data:       # SQLite memory, telemetry, traces — persists across restarts
+  jarvis-reports:    # HN digest markdown reports
