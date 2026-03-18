@@ -1251,6 +1251,47 @@ async def slash_brainstorm(interaction: discord.Interaction, topic: str, count: 
 
 # ── Image generation ──────────────────────────────────────────────────────────
 
+# Gemini Nano Banana 2 image generation costs (standard tier, per image)
+_GEMINI_IMG_COST = {
+    "0.5k": 0.045,  # 512px
+    "1k":   0.067,  # 1024x1024
+    "2k":   0.101,  # 2048x2048
+    "4k":   0.151,  # 4096x4096
+}
+
+
+def _png_dimensions(data: bytes) -> "tuple[int,int] | None":
+    """Extract width/height from PNG header bytes (no deps)."""
+    import struct
+    if data[:4] == b"\x89PNG":
+        try:
+            w, h = struct.unpack(">II", data[16:24])
+            return w, h
+        except Exception:
+            pass
+    return None
+
+
+def _estimate_image_cost(img_bytes: bytes, mime: str) -> str:
+    """Return a human-readable cost string for the generated image."""
+    dims = _png_dimensions(img_bytes) if "png" in mime else None
+    if dims:
+        max_dim = max(dims)
+        if max_dim <= 512:
+            tier, cost = "512px", _GEMINI_IMG_COST["0.5k"]
+        elif max_dim <= 1024:
+            tier, cost = "1024px", _GEMINI_IMG_COST["1k"]
+        elif max_dim <= 2048:
+            tier, cost = "2048px", _GEMINI_IMG_COST["2k"]
+        else:
+            tier, cost = "4096px", _GEMINI_IMG_COST["4k"]
+        return f"~${cost:.3f} ({tier})"
+    # Fallback: estimate from file size (rough proxy)
+    kb = len(img_bytes) / 1024
+    cost = _GEMINI_IMG_COST["2k"] if kb > 500 else _GEMINI_IMG_COST["1k"]
+    return f"~${cost:.3f} (est.)"
+
+
 def _gemini_generate_image(prompt: str) -> "tuple[bytes, str] | str":
     """Call Gemini image generation REST API.
 
@@ -1314,8 +1355,9 @@ async def slash_generate_image(
         fp=__import__("io").BytesIO(img_bytes),
         filename=f"jarvis-{__import__('time').strftime('%H%M%S')}.{ext}",
     )
+    cost_str = _estimate_image_cost(img_bytes, mime)
     await interaction.followup.send(
-        f"🎨 **{prompt[:120]}**",
+        f"🎨 **{prompt[:120]}**\n*model: `{GEMINI_IMAGE_MODEL}` · cost: {cost_str}*",
         file=file,
     )
 
