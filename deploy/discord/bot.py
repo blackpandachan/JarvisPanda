@@ -158,7 +158,8 @@ _jarvis_lock = threading.Lock()
 _BASELINE_TOOLS = [
     "think", "calculator", "retrieval", "web_search",
     "url_fetch", "arxiv_search", "weather", "system_monitor",
-    "file_read", "gemini_escalate", "github_issue",
+    "file_read", "memory_store", "memory_search",
+    "gemini_escalate", "github_issue", "github_merge",
 ]
 
 # Extra tools from AGENT_EXTRA_TOOLS env var (comma-separated) let operators
@@ -889,6 +890,291 @@ async def _(message: discord.Message, idea: str) -> None:
 
     async with message.channel.typing():
         reply = await loop.run_in_executor(_executor, _propose)
+    await send_chunked(message.channel, reply)
+
+
+# ── Memory commands ───────────────────────────────────────────────────────────
+
+@cmd.prefix("!remember ", "!remember <fact>", "store a fact to your personal memory")
+async def _(message: discord.Message, fact: str) -> None:
+    if not fact:
+        await message.channel.send("Usage: `!remember <fact or note>` — stores it to your memory.")
+        return
+    user_id      = message.author.id
+    display_name = message.author.display_name
+    loop         = asyncio.get_event_loop()
+
+    def _remember() -> str:
+        result = _call_tool(
+            "memory_store",
+            content=fact,
+            source=f"user:{user_id}:manual",
+            metadata={"user_id": str(user_id), "display_name": display_name},
+        )
+        if result is not None:
+            return f"✅ Remembered: _{fact[:200]}_"
+        # Fallback: let the agent do it
+        return _run_ask(
+            f"Store this fact to long-term memory using memory_store. "
+            f"Set source to 'user:{user_id}:manual'.\n\nFact: {fact}",
+            user_id, display_name,
+        )
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(_executor, _remember)
+    await send_chunked(message.channel, reply)
+
+
+@cmd.prefix("!forget ", "!forget <query>", "delete memories matching a query")
+async def _(message: discord.Message, query: str) -> None:
+    if not query:
+        await message.channel.send("Usage: `!forget <search terms>` — removes matching memories.")
+        return
+    user_id      = message.author.id
+    display_name = message.author.display_name
+    loop         = asyncio.get_event_loop()
+
+    def _forget() -> str:
+        rows = _search_user_memory(query, user_id)
+        if not rows:
+            return f"No memories found matching '{query}'."
+        db = Path(MEMORY_DB_PATH)
+        deleted = 0
+        try:
+            conn = sqlite3.connect(str(db), timeout=5)
+            uid_filter = f"%user:{user_id}%"
+            cur = conn.cursor()
+            for row in rows:
+                content = row.get("content", "")
+                try:
+                    cur.execute(
+                        "DELETE FROM memories WHERE content = ? AND (source LIKE ? OR metadata LIKE ?)",
+                        (content, uid_filter, uid_filter),
+                    )
+                    deleted += cur.rowcount
+                except Exception:
+                    pass
+            conn.commit()
+            conn.close()
+        except Exception as exc:
+            return f"⚠️ Failed to delete memories: {exc}"
+        return f"🗑️ Deleted {deleted} memor{'y' if deleted == 1 else 'ies'} matching '{query}'."
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(_executor, _forget)
+    await send_chunked(message.channel, reply)
+
+
+@cmd.exact("!whoami", "show what Jarvis knows about you from memory")
+async def _(message: discord.Message) -> None:
+    user_id      = message.author.id
+    display_name = message.author.display_name
+    loop         = asyncio.get_event_loop()
+
+    def _whoami() -> str:
+        rows = _search_user_memory("", user_id)
+        # Broader search: get all user-tagged memories
+        db = Path(MEMORY_DB_PATH)
+        all_rows: list[dict] = []
+        try:
+            conn = sqlite3.connect(str(db), timeout=5)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            uid_filter = f"%user:{user_id}%"
+            cur.execute(
+                "SELECT content, source FROM memories "
+                "WHERE source LIKE ? OR metadata LIKE ? LIMIT 20",
+                (uid_filter, uid_filter),
+            )
+            all_rows = [dict(r) for r in cur.fetchall()]
+            conn.close()
+        except Exception:
+            all_rows = rows
+
+        if not all_rows:
+            return (
+                f"I don't have any memories about you yet, {display_name}.\n"
+                "Chat with me, use `!remember`, or run `!research` on a topic to build your memory."
+            )
+        lines = [f"**What I know about {display_name}** ({len(all_rows)} memories)"]
+        for i, r in enumerate(all_rows[:15], 1):
+            src = r.get("source", "")
+            tag = src.split(":")[-1] if ":" in src else ""
+            content = r.get("content", "")[:200]
+            lines.append(f"**{i}.** {content}" + (f"\n   _[{tag}]_" if tag else ""))
+        return "\n\n".join(lines)
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(_executor, _whoami)
+    await reply_long(message, reply, f"Memories: {display_name}")
+
+
+# ── Knowledge commands ────────────────────────────────────────────────────────
+
+@cmd.prefix("!explain ", "!explain <concept>", "explain at three levels: simple, intermediate, expert")
+async def _(message: discord.Message, concept: str) -> None:
+    if not concept:
+        await message.channel.send("Usage: `!explain <concept or topic>`")
+        return
+    user_id      = message.author.id
+    display_name = message.author.display_name
+    loop         = asyncio.get_event_loop()
+
+    def _explain() -> str:
+        return _run_ask(
+            f"Explain '{concept}' at three levels:\n\n"
+            "**Simple (ELI5):** 2-3 sentences anyone can understand.\n\n"
+            "**Intermediate:** 3-5 sentences with key concepts and how they connect.\n\n"
+            "**Expert:** 3-5 sentences with technical depth, edge cases, and nuance.\n\n"
+            "Use web_search if the concept is recent or you need to verify details. "
+            "Be concise and concrete at each level.",
+            user_id, display_name,
+        )
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(_executor, _explain)
+    await reply_long(message, reply, f"Explain: {concept[:50]}")
+
+
+@cmd.prefix("!compare ", "!compare <X> vs <Y>", "structured comparison of two things")
+async def _(message: discord.Message, arg: str) -> None:
+    if not arg or " vs " not in arg.lower():
+        await message.channel.send("Usage: `!compare <X> vs <Y>` — e.g. `!compare PyTorch vs JAX`")
+        return
+    user_id      = message.author.id
+    display_name = message.author.display_name
+    loop         = asyncio.get_event_loop()
+
+    def _compare() -> str:
+        return _run_ask(
+            f"Compare {arg} in a structured way.\n\n"
+            "Use web_search to get current, accurate information.\n\n"
+            "Format:\n"
+            "**Overview:** one sentence each on what both are.\n"
+            "**Key differences:** 4-6 bullet points covering the most important distinctions.\n"
+            "**When to use X:** 2-3 specific scenarios.\n"
+            "**When to use Y:** 2-3 specific scenarios.\n"
+            "**Verdict:** Which is better and for whom (be direct).",
+            user_id, display_name,
+        )
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(_executor, _compare)
+    await reply_long(message, reply, f"Compare: {arg[:60]}")
+
+
+@cmd.prefix("!debate ", "!debate <topic>", "structured pros and cons analysis")
+async def _(message: discord.Message, topic: str) -> None:
+    if not topic:
+        await message.channel.send("Usage: `!debate <topic or claim>`")
+        return
+    user_id      = message.author.id
+    display_name = message.author.display_name
+    loop         = asyncio.get_event_loop()
+
+    def _debate() -> str:
+        return _run_ask(
+            f"Analyse: '{topic}'\n\n"
+            "Use web_search to find real arguments and evidence.\n\n"
+            "Format:\n"
+            "**For (strongest arguments):** 3-4 bullet points with evidence/reasoning.\n"
+            "**Against (strongest counterarguments):** 3-4 bullet points with evidence/reasoning.\n"
+            "**Nuance:** 1-2 important caveats or context the debate often misses.\n"
+            "**Bottom line:** your honest synthesis in 2-3 sentences.",
+            user_id, display_name,
+        )
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(_executor, _debate)
+    await reply_long(message, reply, f"Debate: {topic[:50]}")
+
+
+@cmd.exact("!trending", "what's trending in AI/tech right now")
+async def _(message: discord.Message) -> None:
+    loop = asyncio.get_event_loop()
+
+    def _trending() -> str:
+        return _run_ask(
+            "What's trending in AI and tech right now? Use web_search with multiple queries:\n"
+            "1. 'AI news today' or 'AI announcements this week'\n"
+            "2. 'trending AI tools' or 'viral AI demos'\n"
+            "3. Check Hacker News and/or arXiv for hottest recent posts.\n\n"
+            "Format as:\n"
+            "**Top stories this week** — 3-4 items with a link and 1-sentence description each.\n"
+            "**Hot tools/models** — 2-3 notable releases or demos.\n"
+            "**Worth watching** — 1-2 early-stage things gaining traction."
+        )
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(_executor, _trending)
+    await reply_long(message, reply, "Trending in AI/Tech")
+
+
+@cmd.prefix("!deep-dive ", "!deep-dive <topic>", "deep multi-source research synthesis (slow, thorough)")
+async def _(message: discord.Message, topic: str) -> None:
+    if not topic:
+        await message.channel.send("Usage: `!deep-dive <topic>` — thorough multi-source research, saved to memory.")
+        return
+    user_id      = message.author.id
+    display_name = message.author.display_name
+    await message.channel.send(
+        f"Starting deep research on **{topic}**…\n"
+        "This runs up to 15 agent turns with web search + arXiv. Results saved to your memory."
+    )
+    loop = asyncio.get_event_loop()
+
+    def _deep() -> str:
+        return _run_ask(
+            f"Perform a comprehensive deep research on: '{topic}'\n\n"
+            "Strategy (use ALL of these):\n"
+            "1. web_search with 3+ different query angles\n"
+            "2. arxiv_search for academic/technical papers\n"
+            "3. url_fetch to read 2-3 key sources in depth\n"
+            "4. think to synthesise findings at each stage\n"
+            "5. memory_store key findings tagged with 'user:{user_id}:deepdive:{topic[:25]}'\n\n"
+            "Output a structured report:\n"
+            "- **Executive Summary** (3-4 sentences)\n"
+            "- **Key Findings** (5-8 bullet points with sources)\n"
+            "- **Technical Details** (if applicable)\n"
+            "- **Current State / Recent Developments**\n"
+            "- **Open Questions / Controversies**\n"
+            "- **Key Sources** (list URLs used)",
+            user_id, display_name,
+        )
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(_executor, _deep)
+    await reply_long(message, reply, f"Deep dive: {topic[:50]}")
+
+
+@cmd.exact("!models", "list Ollama models available locally")
+async def _(message: discord.Message) -> None:
+    loop = asyncio.get_event_loop()
+
+    def _models() -> str:
+        ollama_host = os.environ.get("OLLAMA_HOST", "http://host.docker.internal:11434")
+        try:
+            resp = httpx.get(f"{ollama_host}/api/tags", timeout=10)
+            resp.raise_for_status()
+            data   = resp.json()
+            models = data.get("models", [])
+            if not models:
+                return f"No Ollama models found at `{ollama_host}`."
+            lines = [f"**Ollama models** ({len(models)} available at `{ollama_host}`)", "```"]
+            for m in sorted(models, key=lambda x: x.get("name", "")):
+                name  = m.get("name", "?")
+                size  = m.get("size", 0)
+                size_str = f"{size / 1e9:.1f}GB" if size > 1e8 else ""
+                modified = (m.get("modified_at") or "")[:10]
+                lines.append(f"  {name:<35} {size_str:<8} {modified}")
+            lines.append("```")
+            lines.append(f"Active model: `{os.environ.get('JARVIS_MODEL', 'qwen3:8b')}` (configured in `config.persistent.toml`)")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"⚠️ Could not reach Ollama at `{ollama_host}`: {exc}"
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(_executor, _models)
     await send_chunked(message.channel, reply)
 
 
@@ -2183,31 +2469,268 @@ async def slash_task_log(interaction: discord.Interaction, id: str) -> None:
     await _slash_reply(interaction, _logs)
 
 
+@tree.command(name="remember", description="Store a fact or note to your personal long-term memory")
+@discord.app_commands.describe(fact="The fact, note, or information to remember")
+async def slash_remember(interaction: discord.Interaction, fact: str) -> None:
+    uid  = interaction.user.id
+    name = interaction.user.display_name
+
+    def _remember() -> str:
+        result = _call_tool(
+            "memory_store",
+            content=fact,
+            source=f"user:{uid}:manual",
+            metadata={"user_id": str(uid), "display_name": name},
+        )
+        if result is not None:
+            return f"✅ Remembered: _{fact[:200]}_"
+        return _run_ask(
+            f"Store this to long-term memory using memory_store. "
+            f"Source: 'user:{uid}:manual'.\n\nFact: {fact}",
+            uid, name,
+        )
+
+    await _slash_reply(interaction, _remember)
+
+
+@tree.command(name="forget", description="Delete memories matching a query")
+@discord.app_commands.describe(query="Search terms for the memories to delete")
+async def slash_forget(interaction: discord.Interaction, query: str) -> None:
+    uid = interaction.user.id
+
+    def _forget() -> str:
+        rows = _search_user_memory(query, uid)
+        if not rows:
+            return f"No memories found matching '{query}'."
+        db = Path(MEMORY_DB_PATH)
+        deleted = 0
+        try:
+            conn = sqlite3.connect(str(db), timeout=5)
+            uid_filter = f"%user:{uid}%"
+            cur = conn.cursor()
+            for row in rows:
+                content = row.get("content", "")
+                try:
+                    cur.execute(
+                        "DELETE FROM memories WHERE content = ? AND (source LIKE ? OR metadata LIKE ?)",
+                        (content, uid_filter, uid_filter),
+                    )
+                    deleted += cur.rowcount
+                except Exception:
+                    pass
+            conn.commit()
+            conn.close()
+        except Exception as exc:
+            return f"⚠️ Failed to delete memories: {exc}"
+        return f"🗑️ Deleted {deleted} memor{'y' if deleted == 1 else 'ies'} matching '{query}'."
+
+    await _slash_reply(interaction, _forget)
+
+
+@tree.command(name="whoami", description="Show everything Jarvis knows about you from memory")
+async def slash_whoami(interaction: discord.Interaction) -> None:
+    uid  = interaction.user.id
+    name = interaction.user.display_name
+
+    def _whoami() -> str:
+        db = Path(MEMORY_DB_PATH)
+        all_rows: list[dict] = []
+        try:
+            conn = sqlite3.connect(str(db), timeout=5)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            uid_filter = f"%user:{uid}%"
+            cur.execute(
+                "SELECT content, source FROM memories "
+                "WHERE source LIKE ? OR metadata LIKE ? LIMIT 20",
+                (uid_filter, uid_filter),
+            )
+            all_rows = [dict(r) for r in cur.fetchall()]
+            conn.close()
+        except Exception:
+            pass
+        if not all_rows:
+            return (
+                f"I don't have any memories about you yet, {name}.\n"
+                "Chat with me, use `/remember`, or run `/research` on topics to build your memory."
+            )
+        lines = [f"**What I know about {name}** ({len(all_rows)} memories)"]
+        for i, r in enumerate(all_rows[:15], 1):
+            src = r.get("source", "")
+            tag = src.split(":")[-1] if ":" in src else ""
+            content = r.get("content", "")[:200]
+            lines.append(f"**{i}.** {content}" + (f"\n   _[{tag}]_" if tag else ""))
+        return "\n\n".join(lines)
+
+    await _slash_reply(interaction, _whoami, thread_name=f"Memories: {name}")
+
+
+@tree.command(name="explain", description="Explain a concept at simple, intermediate, and expert levels")
+@discord.app_commands.describe(concept="What to explain")
+async def slash_explain(interaction: discord.Interaction, concept: str) -> None:
+    uid  = interaction.user.id
+    name = interaction.user.display_name
+
+    def _explain() -> str:
+        return _run_ask(
+            f"Explain '{concept}' at three levels:\n\n"
+            "**Simple (ELI5):** 2-3 sentences anyone can understand.\n\n"
+            "**Intermediate:** 3-5 sentences with key concepts and how they connect.\n\n"
+            "**Expert:** 3-5 sentences with technical depth, edge cases, and nuance.\n\n"
+            "Use web_search if recent or technical. Be concise and concrete.",
+            uid, name,
+        )
+
+    await _slash_reply(interaction, _explain, thread_name=f"Explain: {concept[:50]}")
+
+
+@tree.command(name="compare", description="Structured comparison of two things")
+@discord.app_commands.describe(items="What to compare, e.g. 'PyTorch vs JAX'")
+async def slash_compare(interaction: discord.Interaction, items: str) -> None:
+    uid  = interaction.user.id
+    name = interaction.user.display_name
+
+    if " vs " not in items.lower():
+        await interaction.response.send_message(
+            "Format: `/compare items:X vs Y` — e.g. `/compare items:PyTorch vs JAX`",
+            ephemeral=True,
+        )
+        return
+
+    def _compare() -> str:
+        return _run_ask(
+            f"Compare {items}.\n\nUse web_search for current info.\n\n"
+            "**Overview:** one sentence each.\n"
+            "**Key differences:** 4-6 bullet points.\n"
+            "**When to use each:** 2-3 scenarios each.\n"
+            "**Verdict:** direct recommendation.",
+            uid, name,
+        )
+
+    await _slash_reply(interaction, _compare, thread_name=f"Compare: {items[:60]}")
+
+
+@tree.command(name="debate", description="Structured pros and cons analysis for any claim or topic")
+@discord.app_commands.describe(topic="Topic or claim to analyse")
+async def slash_debate(interaction: discord.Interaction, topic: str) -> None:
+    uid  = interaction.user.id
+    name = interaction.user.display_name
+
+    def _debate() -> str:
+        return _run_ask(
+            f"Analyse: '{topic}'\n\nUse web_search for real arguments.\n\n"
+            "**For:** 3-4 bullet points with evidence.\n"
+            "**Against:** 3-4 bullet points with evidence.\n"
+            "**Nuance:** 1-2 caveats the debate often misses.\n"
+            "**Bottom line:** honest synthesis in 2-3 sentences.",
+            uid, name,
+        )
+
+    await _slash_reply(interaction, _debate, thread_name=f"Debate: {topic[:50]}")
+
+
+@tree.command(name="trending", description="What's trending in AI and tech right now")
+async def slash_trending(interaction: discord.Interaction) -> None:
+    def _trending() -> str:
+        return _run_ask(
+            "What's trending in AI and tech right now? Use web_search with multiple queries.\n\n"
+            "**Top stories this week** — 3-4 items with link + 1-sentence description.\n"
+            "**Hot tools/models** — 2-3 notable releases or demos.\n"
+            "**Worth watching** — 1-2 early-stage things gaining traction."
+        )
+
+    await _slash_reply(interaction, _trending, thread_name="Trending in AI/Tech")
+
+
+@tree.command(name="deep-dive", description="Thorough multi-source research with arXiv + web, saved to memory")
+@discord.app_commands.describe(topic="Topic for deep research")
+async def slash_deep_dive(interaction: discord.Interaction, topic: str) -> None:
+    uid  = interaction.user.id
+    name = interaction.user.display_name
+    await interaction.response.defer(thinking=True)
+    await interaction.followup.send(
+        f"Starting deep research on **{topic}**…\n"
+        "Running up to 15 agent turns with web search + arXiv. Results saved to your memory."
+    )
+    loop  = asyncio.get_event_loop()
+    reply = await loop.run_in_executor(
+        _executor,
+        lambda: _run_ask(
+            f"Comprehensive deep research on: '{topic}'\n\n"
+            "Use web_search (3+ angles), arxiv_search, url_fetch (2-3 sources), think to synthesise, "
+            f"memory_store tagged 'user:{uid}:deepdive:{topic[:25]}'.\n\n"
+            "Output: Executive Summary, Key Findings (with sources), Technical Details, "
+            "Recent Developments, Open Questions, Key Sources.",
+            uid, name,
+        ),
+    )
+    chunks = [reply[i : i + MAX_MSG_LEN] for i in range(0, max(len(reply), 1), MAX_MSG_LEN)]
+    for chunk in chunks:
+        await interaction.followup.send(chunk)
+
+
+@tree.command(name="models", description="List Ollama models available on this machine")
+async def slash_models(interaction: discord.Interaction) -> None:
+    def _models() -> str:
+        ollama_host = os.environ.get("OLLAMA_HOST", "http://host.docker.internal:11434")
+        try:
+            resp = httpx.get(f"{ollama_host}/api/tags", timeout=10)
+            resp.raise_for_status()
+            data   = resp.json()
+            models = data.get("models", [])
+            if not models:
+                return f"No Ollama models found at `{ollama_host}`."
+            lines = [f"**Ollama models** ({len(models)} at `{ollama_host}`)", "```"]
+            for m in sorted(models, key=lambda x: x.get("name", "")):
+                name_m  = m.get("name", "?")
+                size    = m.get("size", 0)
+                size_str = f"{size / 1e9:.1f}GB" if size > 1e8 else ""
+                modified = (m.get("modified_at") or "")[:10]
+                lines.append(f"  {name_m:<35} {size_str:<8} {modified}")
+            lines.append("```")
+            lines.append(f"Active: `{os.environ.get('JARVIS_MODEL', 'qwen3:8b')}`")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"⚠️ Could not reach Ollama at `{ollama_host}`: {exc}"
+
+    await _slash_reply(interaction, _models)
+
+
 @tree.command(name="help", description="Show all Jarvis commands and capabilities")
 async def slash_help(interaction: discord.Interaction) -> None:
     lines = [
         "**Jarvis — command reference**",
         "",
         "**Conversation**",
-        "`/ask <query>` — ask anything (local model → Gemini → GitHub issue escalation)",
-        "`/ask-gemini <question>` — bypass local model, ask Gemini 3 Flash directly",
-        "`/agent <task>` — run a one-shot OrchestratorAgent task with full tool access",
+        "`/ask <query>` — ask anything (local qwen3 → Gemini → GitHub issue escalation)",
+        "`/ask-gemini <question>` — ask Gemini 3 Flash directly",
+        "`/agent <task>` — one-shot OrchestratorAgent task with full tool access",
         "",
         "**Research & Information**",
-        "`/research <topic>` — multi-source deep research, stored to your memory",
-        "`/arxiv <query>` — search recent arXiv papers",
+        "`/research <topic>` — multi-source research synthesis, saved to memory",
+        "`/deep-dive <topic>` — thorough 15-turn research with arXiv + web + memory",
+        "`/arxiv <query>` — search arXiv papers",
         "`/papers [topic]` — latest AI/ML arXiv papers",
         "`/summarize <url>` — fetch and summarise a web page",
         "`/weather [city]` — current conditions + 3-day forecast",
         "`/brief` — morning brief: weather + top AI story + daily insight",
         "`/digest` — on-demand Hacker News AI digest",
+        "`/trending` — what's trending in AI and tech right now",
+        "",
+        "**Knowledge**",
+        "`/explain <concept>` — three-level explanation: simple / intermediate / expert",
+        "`/compare <X vs Y>` — structured comparison with web research",
+        "`/debate <topic>` — structured pros and cons analysis",
         "",
         "**Memory**",
         "`/memory <query>` — search your personal memory store",
+        "`/remember <fact>` — explicitly store something to your memory",
+        "`/forget <query>` — delete memories matching a query",
+        "`/whoami` — show everything Jarvis knows about you",
         "",
         "**GitHub & Code**",
         "`/propose <idea>` — draft a feature proposal and cut a GitHub issue",
-        "`/build-tool <description>` — spec and propose a new Jarvis tool via GitHub",
+        "`/build-tool <description>` — spec and propose a new Jarvis tool",
         "`/queue` — show open `claude-code-work` issues queued for Gemini",
         "`/prs` — list open pull requests",
         "`/pr <number>` — show PR details and changed files",
@@ -2217,24 +2740,21 @@ async def slash_help(interaction: discord.Interaction) -> None:
         "`/run-skill <name> [args]` — execute a registered Jarvis skill pipeline",
         "`/skills` — list available skill pipelines",
         "`/tools` — list all registered agent tools",
+        "`/models` — list Ollama models available locally",
         "",
         "**Scheduler**",
         "`/schedule cron|interval <value> <prompt>` — create a recurring background task",
-        "`/tasks` — list all scheduled tasks and their status",
-        "`/pause-task <id>` — pause a task temporarily",
-        "`/resume-task <id>` — resume a paused task",
-        "`/cancel-task <id>` — permanently cancel a task",
-        "`/task-log <id>` — show run history for a task",
+        "`/tasks` — list all scheduled tasks",
+        "`/pause-task <id>` · `/resume-task <id>` · `/cancel-task <id>` · `/task-log <id>`",
         "",
         "**System**",
         "`/status` — engine, model, Gemini/GitHub config, and host stats",
         "`/health` — on-demand system health check",
         "",
-        "**Prefix commands** — all of the above also work as `!command` in any channel.",
-        "In <#{CHANNEL_NAME}> just type directly — no prefix needed.".replace("{CHANNEL_NAME}", CHANNEL_NAME),
-        "Mention `@Jarvis <query>` anywhere.",
+        "**Prefix commands** — all commands also work as `!command` in any channel.",
+        "In #" + CHANNEL_NAME + " just type — no prefix needed. `@Jarvis <query>` works anywhere.",
         "",
-        "*Three-tier escalation: local qwen3 → Gemini 3 Flash → GitHub issue → Gemini Actions worker → PR*",
+        "*Stack: qwen3:8b (local) → Gemini 3 Flash → GitHub Actions → PR*",
     ]
     # Split into two messages to stay under 2000 chars
     full = "\n".join(lines)
