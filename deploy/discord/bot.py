@@ -50,7 +50,9 @@ CHANNEL_NAME      = os.environ.get("DISCORD_CHANNEL_NAME", "jarvis")
 DEFAULT_CITY      = os.environ.get("DEFAULT_WEATHER_CITY", "")
 MEMORY_DB_PATH    = os.environ.get("MEMORY_DB_PATH", "/data/memory.db")
 DISCORD_WEBHOOK   = os.environ.get("DISCORD_DIGEST_WEBHOOK", "")
-OLLAMA_HOST       = os.environ.get("OLLAMA_HOST", "http://host.docker.internal:11434")
+OLLAMA_HOST          = os.environ.get("OLLAMA_HOST", "http://host.docker.internal:11434")
+GEMINI_API_KEY       = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_IMAGE_MODEL   = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image-preview")
 
 _GUILD_ID_STR    = os.environ.get("DISCORD_GUILD_ID", "")
 DISCORD_GUILD_ID: int | None = int(_GUILD_ID_STR) if _GUILD_ID_STR.isdigit() else None
@@ -1117,6 +1119,404 @@ async def slash_task_log(interaction: discord.Interaction, id: str) -> None:
     await _slash_reply(interaction, _logs)
 
 
+# ── Interactive / Fun ─────────────────────────────────────────────────────────
+
+@tree.command(name="poll", description="Create a quick Discord poll")
+@discord.app_commands.describe(
+    question="The poll question",
+    options="Comma-separated options (2–10). Leave blank for Yes / No.",
+    duration_hours="Poll duration in hours (default 24, max 168)",
+)
+async def slash_poll(
+    interaction: discord.Interaction,
+    question: str,
+    options: str = "",
+    duration_hours: int = 24,
+) -> None:
+    raw_opts = [o.strip() for o in options.split(",") if o.strip()] if options else ["Yes", "No"]
+    if len(raw_opts) < 2:
+        await interaction.response.send_message("Need at least 2 options.", ephemeral=True)
+        return
+    raw_opts = raw_opts[:10]
+    duration_hours = max(1, min(duration_hours, 168))
+
+    # Native Discord poll (discord.py 2.4+)
+    if hasattr(discord, "Poll"):
+        poll = discord.Poll(question=question, duration=discord.utils.utcnow() + __import__("datetime").timedelta(hours=duration_hours))  # type: ignore[attr-defined]
+        for opt in raw_opts:
+            poll.add_answer(text=opt)  # type: ignore[attr-defined]
+        await interaction.response.send_message(poll=poll)
+    else:
+        # Fallback: embed + numbered reactions
+        emoji_map = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+        lines = [f"📊 **{question}**", ""]
+        for i, opt in enumerate(raw_opts):
+            lines.append(f"{emoji_map[i]}  {opt}")
+        lines.append(f"\n*Poll closes in {duration_hours}h — react to vote!*")
+        await interaction.response.send_message("\n".join(lines))
+        msg = await interaction.original_response()
+        for i in range(len(raw_opts)):
+            await msg.add_reaction(emoji_map[i])
+
+
+@tree.command(name="trivia", description="Jarvis generates a trivia question with a live poll")
+@discord.app_commands.describe(topic="Topic for the trivia question (leave blank for random)")
+async def slash_trivia(interaction: discord.Interaction, topic: str = "") -> None:
+    await interaction.response.defer(thinking=True)
+    uid, name = interaction.user.id, interaction.user.display_name
+    subject = topic or "general knowledge (science, history, pop culture, or tech)"
+    loop = asyncio.get_event_loop()
+    raw = await loop.run_in_executor(
+        _executor,
+        lambda: _run_ask(
+            f"Generate a fun trivia question about: {subject}\n\n"
+            "Format your response EXACTLY like this — no extra text:\n"
+            "QUESTION: <question text>\n"
+            "A: <option A>\n"
+            "B: <option B>\n"
+            "C: <option C>\n"
+            "D: <option D>\n"
+            "ANSWER: <A, B, C, or D>\n"
+            "FUN FACT: <one sentence about the answer>",
+            uid, name,
+        ),
+    )
+    # Parse the response
+    lines = {
+        ln.split(":", 1)[0].strip().upper(): ln.split(":", 1)[1].strip()
+        for ln in raw.splitlines()
+        if ":" in ln
+    }
+    question = lines.get("QUESTION", "Trivia question")
+    opts = [
+        lines.get("A", "Option A"),
+        lines.get("B", "Option B"),
+        lines.get("C", "Option C"),
+        lines.get("D", "Option D"),
+    ]
+    answer   = lines.get("ANSWER", "?")
+    fun_fact = lines.get("FUN FACT", "")
+    emoji_map = ["🇦","🇧","🇨","🇩"]
+
+    if hasattr(discord, "Poll"):
+        poll = discord.Poll(question=f"🧠 {question}", duration=__import__("datetime").timedelta(hours=24))  # type: ignore[attr-defined]
+        for opt in opts:
+            poll.add_answer(text=opt)  # type: ignore[attr-defined]
+        await interaction.followup.send(poll=poll)
+    else:
+        body = [f"🧠 **{question}**", ""]
+        for i, opt in enumerate(opts):
+            body.append(f"{emoji_map[i]}  {opt}")
+        body.append("\n*React to vote — answer revealed after 24h!*")
+        msg = await interaction.followup.send("\n".join(body), wait=True)
+        for em in emoji_map:
+            await msg.add_reaction(em)
+
+    # Post spoiler answer in thread so it's hidden
+    spoiler = f"||**Answer: {answer}**"
+    if fun_fact:
+        spoiler += f"\n{fun_fact}"
+    spoiler += "||"
+    if isinstance(interaction.channel, discord.TextChannel):
+        try:
+            resp = await interaction.original_response()
+            thr = await resp.create_thread(name=f"Trivia Answer: {question[:50]}", auto_archive_duration=1440)
+            await thr.send(f"🔒 Spoiler hidden — check back after voting!\n{spoiler}")
+        except Exception:
+            await interaction.followup.send(spoiler, ephemeral=True)
+    else:
+        await interaction.followup.send(spoiler, ephemeral=True)
+
+
+@tree.command(name="brainstorm", description="Generate a burst of diverse ideas on any topic")
+@discord.app_commands.describe(
+    topic="What to brainstorm about",
+    count="Number of ideas to generate (default 10)",
+)
+async def slash_brainstorm(interaction: discord.Interaction, topic: str, count: int = 10) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
+    count = max(5, min(count, 20))
+    await _slash_reply(
+        interaction,
+        lambda: _run_ask(
+            f"Brainstorm {count} distinct, creative ideas about: {topic}\n\n"
+            "Cover different angles — practical, wild, contrarian, cross-domain. "
+            "Format as a numbered list with a brief (1-sentence) description of each idea. "
+            "Then add a **Best bet:** line picking your top idea and why.",
+            uid, name,
+        ),
+        thread_name=f"Brainstorm: {topic[:60]}",
+    )
+
+
+# ── Image generation ──────────────────────────────────────────────────────────
+
+def _gemini_generate_image(prompt: str) -> "tuple[bytes, str] | str":
+    """Call Gemini image generation REST API.
+
+    Returns (image_bytes, mime_type) on success or an error string.
+    """
+    import base64
+    if not GEMINI_API_KEY:
+        return "GEMINI_API_KEY is not set — cannot generate images."
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_IMAGE_MODEL}:generateContent"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"response_modalities": ["TEXT", "IMAGE"]},
+    }
+    try:
+        resp = httpx.post(url, params={"key": GEMINI_API_KEY}, json=payload, timeout=120)
+        resp.raise_for_status()
+        data = resp.json()
+        parts = data["candidates"][0]["content"]["parts"]
+        for part in parts:
+            if "inlineData" in part:
+                mime  = part["inlineData"].get("mimeType", "image/png")
+                img_b = base64.b64decode(part["inlineData"]["data"])
+                return img_b, mime
+        # Text-only response (safety refusal, etc.)
+        for part in parts:
+            if "text" in part:
+                return f"Gemini declined to generate: {part['text']}"
+        return "No image in Gemini response."
+    except Exception as exc:
+        return f"Image generation error: {exc}"
+
+
+@tree.command(name="generate-image", description="Generate an image with Gemini (Nano Banana 2)")
+@discord.app_commands.describe(
+    prompt="Describe the image you want",
+    aspect_ratio="Aspect ratio: 1:1, 16:9, 9:16, 4:3, 3:4 (default: 1:1)",
+)
+async def slash_generate_image(
+    interaction: discord.Interaction,
+    prompt: str,
+    aspect_ratio: str = "1:1",
+) -> None:
+    if not GEMINI_API_KEY:
+        await interaction.response.send_message(
+            "⚠️ `GEMINI_API_KEY` is not set in the environment.", ephemeral=True
+        )
+        return
+    await interaction.response.defer(thinking=True)
+    full_prompt = f"{prompt}\nAspect ratio: {aspect_ratio}"
+    loop   = asyncio.get_event_loop()
+    result = await loop.run_in_executor(_executor, _gemini_generate_image, full_prompt)
+    if isinstance(result, str):
+        await interaction.followup.send(f"⚠️ {result}")
+        return
+    img_bytes, mime = result
+    ext = mime.split("/")[-1] if "/" in mime else "png"
+    file = discord.File(
+        fp=__import__("io").BytesIO(img_bytes),
+        filename=f"jarvis-{__import__('time').strftime('%H%M%S')}.{ext}",
+    )
+    await interaction.followup.send(
+        f"🎨 **{prompt[:120]}**",
+        file=file,
+    )
+
+
+# ── Writing & Language ─────────────────────────────────────────────────────────
+
+@tree.command(name="translate", description="Translate text into another language")
+@discord.app_commands.describe(
+    text="The text to translate",
+    language="Target language (e.g. Spanish, French, Japanese — default: English)",
+)
+async def slash_translate(
+    interaction: discord.Interaction,
+    text: str,
+    language: str = "English",
+) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
+    await _slash_reply(
+        interaction,
+        lambda: _run_ask(
+            f"Translate the following text to {language}. "
+            "Preserve tone, formatting, and any technical terms. "
+            "After the translation, add a brief note about any tricky phrases or cultural nuances.\n\n"
+            f"Text:\n{text}",
+            uid, name,
+        ),
+    )
+
+
+@tree.command(name="meeting-notes", description="Structure and summarise meeting notes or a transcript")
+@discord.app_commands.describe(notes="Paste your raw meeting notes or transcript")
+async def slash_meeting_notes(interaction: discord.Interaction, notes: str) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
+    await _slash_reply(
+        interaction,
+        lambda: _run_ask(
+            "Structure these meeting notes into a clean summary:\n\n"
+            f"{notes}\n\n"
+            "Format:\n"
+            "## Summary\n(2-3 sentence overview)\n\n"
+            "## Key Decisions\n(bullet list)\n\n"
+            "## Action Items\n(bullet list with owner and deadline if mentioned)\n\n"
+            "## Open Questions\n(anything unresolved)",
+            uid, name,
+        ),
+        thread_name="Meeting Notes",
+    )
+
+
+@tree.command(name="todo", description="Extract action items from notes, a message, or a wall of text")
+@discord.app_commands.describe(text="Paste the text to extract todos from")
+async def slash_todo(interaction: discord.Interaction, text: str) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
+    await _slash_reply(
+        interaction,
+        lambda: _run_ask(
+            "Extract all action items, tasks, and follow-ups from the text below. "
+            "For each item: note the responsible person (if mentioned), deadline (if mentioned), "
+            "and urgency (high/medium/low). Format as a checklist.\n\n"
+            f"Text:\n{text}",
+            uid, name,
+        ),
+    )
+
+
+@tree.command(name="email-draft", description="Draft a professional email from bullet points or a brief")
+@discord.app_commands.describe(
+    brief="What the email needs to say (bullet points or rough notes)",
+    tone="Tone: professional, friendly, formal, concise (default: professional)",
+)
+async def slash_email_draft(
+    interaction: discord.Interaction,
+    brief: str,
+    tone: str = "professional",
+) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
+    await _slash_reply(
+        interaction,
+        lambda: _run_ask(
+            f"Write a {tone} email based on these notes:\n\n{brief}\n\n"
+            "Include a clear subject line, opening, body, and closing. "
+            "Keep it concise and action-oriented.",
+            uid, name,
+        ),
+    )
+
+
+# ── Knowledge & Memory ─────────────────────────────────────────────────────────
+
+@tree.command(name="index", description="Index a URL or text snippet into your knowledge base")
+@discord.app_commands.describe(
+    source="A URL to fetch-and-index, or paste text directly",
+    tags="Optional comma-separated tags (e.g. 'AI, research, 2025')",
+)
+async def slash_index(
+    interaction: discord.Interaction,
+    source: str,
+    tags: str = "",
+) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
+    tag_hint = f" Tag it with: {tags}." if tags else ""
+    is_url = source.startswith("http://") or source.startswith("https://")
+    if is_url:
+        prompt = (
+            f"Fetch and index this URL into long-term memory for user {name} (ID: {uid}).\n"
+            f"URL: {source}\n"
+            f"Use url_fetch to get the content, then memory_store to save a concise summary "
+            f"with source='{source}' and metadata including the URL and today's date.{tag_hint}\n"
+            "Confirm what was saved."
+        )
+    else:
+        prompt = (
+            f"Save the following text to long-term memory for user {name} (ID: {uid}).\n"
+            f"Use memory_store with source='user:{uid}:manual-index'.{tag_hint}\n"
+            f"Content:\n{source}\n\nConfirm what was saved."
+        )
+    await _slash_reply(
+        interaction,
+        lambda: _run_ask(prompt, uid, name),
+        thread_name="Indexed to memory",
+    )
+
+
+# ── Code & Analysis ───────────────────────────────────────────────────────────
+
+@tree.command(name="lint", description="Analyse code quality, style, and potential issues")
+@discord.app_commands.describe(
+    code="Paste the code to analyse",
+    language="Programming language (default: auto-detect)",
+)
+async def slash_lint(
+    interaction: discord.Interaction,
+    code: str,
+    language: str = "auto",
+) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
+    lang_hint = f" Language: {language}." if language != "auto" else ""
+    await _slash_reply(
+        interaction,
+        lambda: _run_ask(
+            f"Analyse this code for quality issues, potential bugs, style problems, "
+            f"and security concerns.{lang_hint}\n\n"
+            "Format:\n"
+            "## Issues Found\n(numbered list with severity: 🔴 critical / 🟡 warning / 🟢 style)\n\n"
+            "## Quick Wins\n(top 3 easiest improvements)\n\n"
+            "## Summary\n(one line overall verdict)\n\n"
+            f"```\n{code}\n```",
+            uid, name,
+        ),
+        thread_name="Code Review",
+    )
+
+
+@tree.command(name="test-gen", description="Generate pytest tests for a function or class")
+@discord.app_commands.describe(
+    code="The function or class to generate tests for",
+    framework="Test framework: pytest, unittest (default: pytest)",
+)
+async def slash_test_gen(
+    interaction: discord.Interaction,
+    code: str,
+    framework: str = "pytest",
+) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
+    await _slash_reply(
+        interaction,
+        lambda: _run_ask(
+            f"Generate comprehensive {framework} tests for the following code.\n"
+            "Include: happy path, edge cases, error cases, boundary conditions.\n"
+            "Use descriptive test names and add brief docstrings.\n\n"
+            f"```python\n{code}\n```",
+            uid, name,
+        ),
+        thread_name="Generated Tests",
+    )
+
+
+@tree.command(name="security-scan", description="Scan code for security vulnerabilities (OWASP top 10 + common issues)")
+@discord.app_commands.describe(code="Paste the code to scan")
+async def slash_security_scan(interaction: discord.Interaction, code: str) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
+    await _slash_reply(
+        interaction,
+        lambda: _run_ask(
+            "Perform a security review of this code. Check for:\n"
+            "- Injection vulnerabilities (SQL, command, SSRF)\n"
+            "- Authentication/authorization flaws\n"
+            "- Sensitive data exposure\n"
+            "- Insecure dependencies or patterns\n"
+            "- Any other OWASP Top 10 concerns\n\n"
+            "Format:\n"
+            "## Vulnerabilities\n(🔴 critical / 🟡 medium / 🟢 low for each finding)\n\n"
+            "## Recommendations\n(actionable fixes)\n\n"
+            "## Verdict\n(safe / needs review / critical issues found)\n\n"
+            f"```\n{code}\n```",
+            uid, name,
+        ),
+        thread_name="Security Scan",
+    )
+
+
 # ── Help ──────────────────────────────────────────────────────────────────────
 
 @tree.command(name="help", description="Show all Jarvis commands and capabilities")
@@ -1124,56 +1524,46 @@ async def slash_help(interaction: discord.Interaction) -> None:
     lines = [
         "**Jarvis** — local AI assistant on OpenJarvis + qwen3:8b",
         "",
-        "Just type in <#" + CHANNEL_NAME + "> or `@Jarvis <question>` — no command needed.",
+        "Just type in #jarvis or `@Jarvis <question>` — no command needed.",
         "",
         "**Conversation**",
-        "`/ask <query>` — ask anything",
-        "`/agent <task>` — explicit OrchestratorAgent run with all tools",
-        "`/react <task>` — NativeReActAgent: shows Thought → Action → Observation trace",
-        "`/ask-gemini <question>` — ask Google Gemini Flash directly",
+        "`/ask` · `/agent` · `/react` · `/ask-gemini`",
         "",
         "**Research & Info**",
-        "`/research <topic>` — multi-source synthesis, saved to memory",
-        "`/deep-dive <topic>` — thorough 15-turn research with arXiv + web",
-        "`/arxiv <query>` — search arXiv papers",
-        "`/papers [topic]` — latest AI/ML arXiv papers",
-        "`/summarize <url>` — fetch and summarise a web page",
-        "`/pdf <url>` — extract and summarise a PDF",
-        "`/weather [city]` — current conditions + forecast",
-        "`/brief` — morning brief: weather + top AI story + insight",
-        "`/digest` — on-demand HN AI digest",
-        "`/trending` — what's hot in AI/tech right now",
+        "`/research` · `/deep-dive` · `/arxiv` · `/papers`",
+        "`/summarize <url>` · `/pdf <url>` · `/weather`",
+        "`/brief` · `/digest` · `/trending`",
         "",
-        "**Knowledge**",
-        "`/explain <concept>` — three-level explanation: simple / intermediate / expert",
-        "`/compare <X vs Y>` — structured comparison with web research",
-        "`/debate <topic>` — pros/cons analysis with evidence",
-        "`/code <question>` — run Python or get a live coded example",
+        "**Knowledge & Analysis**",
+        "`/explain` · `/compare` · `/debate` · `/code`",
+        "`/lint` · `/test-gen` · `/security-scan`",
         "",
-        "**Memory**",
-        "`/memory <query>` — search your personal memory store",
-        "`/remember <fact>` — store something explicitly",
-        "`/forget <query>` — delete matching memories",
-        "`/whoami` — show everything Jarvis knows about you",
+        "**Writing & Language**",
+        "`/translate <text> [language]` — translate to any language",
+        "`/meeting-notes <notes>` — structured summary + action items",
+        "`/todo <text>` — extract action items as a checklist",
+        "`/email-draft <brief>` — draft a professional email",
+        "",
+        "**Interactive & Fun**",
+        "`/poll <question> [options]` — create a Discord poll",
+        "`/trivia [topic]` — Jarvis generates trivia with live poll",
+        "`/brainstorm <topic>` — burst of diverse ideas",
+        "`/generate-image <prompt>` — AI image via Gemini (Nano Banana 2)",
+        "",
+        "**Memory & Knowledge Base**",
+        "`/memory` · `/remember` · `/forget` · `/whoami`",
+        "`/index <url or text>` — save to knowledge base",
         "",
         "**Skills & Tools**",
-        "`/run-skill <name> [args]` — run a skill pipeline",
-        "`/skills` — list available skill pipelines",
-        "`/tools` — list all registered agent tools",
-        "`/models` — list Ollama models available locally",
+        "`/run-skill <name> [args]` · `/skills` · `/tools` · `/models`",
         "",
         "**Scheduler**",
-        "`/schedule cron|interval <value> <prompt>` — create a background task",
-        "`/tasks` — list scheduled tasks",
-        "`/pause-task` · `/resume-task` · `/cancel-task` · `/task-log`",
+        "`/schedule` · `/tasks` · `/pause-task` · `/resume-task` · `/cancel-task` · `/task-log`",
         "",
         "**System**",
-        "`/status` — model, Ollama, Gemini, Tavily, tools loaded",
-        "`/health` — CPU/RAM/GPU + Ollama connectivity",
-        "`/sysinfo` — detailed host stats",
-        "`/mcp` — MCP server status",
+        "`/status` · `/health` · `/sysinfo` · `/mcp`",
         "",
-        "*Stack: qwen3:8b (local) → Gemini Flash (stuck) → that's it, no cloud needed*",
+        "*Stack: qwen3:8b (Ollama) → Gemini Flash (escalation) → Gemini Nano Banana 2 (images)*",
     ]
     full = "\n".join(lines)
     if len(full) <= 1900:
@@ -1239,6 +1629,17 @@ async def on_message(message: discord.Message) -> None:
     loop         = asyncio.get_event_loop()
 
     log.info("[%s] %s (id=%d): %s", message.channel, display_name, user_id, query[:100])
+
+    # Append any image/file attachment URLs to the query so the agent can reference them
+    if message.attachments:
+        attachment_lines = []
+        for att in message.attachments:
+            if any(att.filename.lower().endswith(ext) for ext in (".png",".jpg",".jpeg",".gif",".webp",".bmp")):
+                attachment_lines.append(f"[Attached image: {att.url}]")
+            else:
+                attachment_lines.append(f"[Attached file: {att.filename} — {att.url}]")
+        if attachment_lines:
+            query = query + "\n\n" + "\n".join(attachment_lines) if query else "\n".join(attachment_lines)
 
     thread_ctx = ""
     if isinstance(message.channel, discord.Thread):
