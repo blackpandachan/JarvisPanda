@@ -36,19 +36,47 @@ MAX_CONTEXT     = 120_000  # max chars of code context sent to Gemini
 
 
 def gather_context() -> str:
-    """Collect CLAUDE.md + relevant source files as a single context string."""
+    """Collect CLAUDE.md + relevant source files as a single context string.
+
+    Search order: issue keywords → deploy/ → src/ so the most relevant files
+    (e.g. the Discord bot for Discord issues) are included first.
+    """
     parts: list[str] = []
 
     claude_md = Path("CLAUDE.md")
     if claude_md.exists():
         parts.append(f"=== CLAUDE.md (project guide) ===\n{claude_md.read_text()[:4000]}")
 
-    # Collect Python source files, smallest first to maximise variety
+    # Keyword-based priority: if issue mentions discord/bot, include bot.py first
+    issue_text = (ISSUE_TITLE + " " + ISSUE_BODY).lower()
+    priority_files: list[Path] = []
+
+    if any(k in issue_text for k in ("discord", "bot", "command", "slash", "!version", "!status", "!help")):
+        bot_py = Path("deploy/discord/bot.py")
+        if bot_py.exists():
+            priority_files.append(bot_py)
+
+    if any(k in issue_text for k in ("worker", "observer", "docker", "deploy")):
+        for p in Path("deploy").rglob("*.py"):
+            if p not in priority_files:
+                priority_files.append(p)
+
+    # Add priority files first (full content up to size limit)
+    for path in priority_files:
+        if path.stat().st_size > MAX_FILE_SIZE * 3:  # allow larger for key files
+            content = path.read_text()[:MAX_FILE_SIZE * 3]
+        else:
+            content = path.read_text()
+        parts.append(f"=== {path} ===\n{content}")
+
+    # Then fill with src/ files, smallest first
     py_files = sorted(Path("src").rglob("*.py"), key=lambda p: p.stat().st_size)
-    included = 0
+    included = len(priority_files)
     for path in py_files:
         if included >= MAX_FILES:
             break
+        if path in priority_files:
+            continue
         if path.stat().st_size > MAX_FILE_SIZE:
             continue
         try:
