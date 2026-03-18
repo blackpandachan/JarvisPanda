@@ -1,35 +1,18 @@
-"""Jarvis Discord bot — extensible local-first AI assistant.
+"""Jarvis Discord bot — personal local AI assistant built on OpenJarvis.
 
-Design principles:
-  1. Local models primary  — qwen3:8b via Ollama handles everything it can
-  2. Gemini Flash mid-tier — called when the local agent gets stuck (via the
-     gemini_escalate tool the agent has access to)
-  3. ClaudeCode final tier — GitHub issue cut with Gemini's plan attached,
-     worked asynchronously by the claude-worker container
-  4. Plugin commands       — CommandRegistry lets you add new !commands as
-     decorated async functions without touching the event loop
-  5. Slash commands        — All major commands also registered as /slash-commands
-     via discord.app_commands.CommandTree; synced to Discord on startup
-  6. Dynamic tools         — AGENT_TOOLS is built from ToolRegistry at startup;
-     add a tool to src/openjarvis/tools/ and it appears automatically
-  7. MCP ready             — configure MCP servers in config.persistent.toml;
-     their tools are auto-discovered and added to the agent's tool list
-  8. Per-user memory       — every query is tagged with the Discord user ID so
-     memories are namespaced per person across sessions
-  9. Thread context        — replies in threads carry conversation history
+Design:
+  1. Slash commands primary  — /ask, /research, /code, /pdf, etc.
+  2. Free-form text          — type anything in #jarvis (or @mention) → agent responds
+  3. Local model primary     — qwen3:8b via Ollama, no cloud needed for most tasks
+  4. Gemini Flash mid-tier   — agent escalates when stuck (via gemini_escalate tool)
+  5. Per-user memory         — every interaction tagged with Discord user ID
+  6. Thread context          — replies in threads carry conversation history
+  7. Interactive agents      — agents can post polls, ask follow-up questions, etc.
+  8. Scheduler               — background tasks posted to Discord webhook
 
-Triggers:
-  /slash-command anywhere — slash commands registered with Discord
-  Any message in DISCORD_CHANNEL_NAME (default: #jarvis)
-  @mention anywhere | DISCORD_PREFIX (default: !ask) in any channel
-  Threads whose parent is the #jarvis channel
-
-Adding commands:
-  !prefix  — decorate with @cmd.exact / @cmd.prefix in this file
-  /slash   — decorate with @tree.command() and add to the slash section below
-To add a new tool: create src/openjarvis/tools/my_tool.py and import it
-  in src/openjarvis/tools/__init__.py — it appears in !tools automatically.
-To add MCP tools: add [[tools.mcp.servers]] to config.persistent.toml.
+Adding commands: add a @tree.command() function below the "Slash commands" section.
+Adding tools:    create src/openjarvis/tools/my_tool.py, register with @ToolRegistry.register,
+                 import in tools/__init__.py — appears automatically in /tools and /status.
 """
 
 from __future__ import annotations
@@ -37,10 +20,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
 import sqlite3
 import threading
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -48,11 +30,11 @@ from typing import Any
 import discord
 import httpx
 
-# Scheduler imports — optional, gracefully disabled if not available
+# Scheduler — optional, gracefully disabled if unavailable
 try:
     from openjarvis.scheduler import SchedulerStore, TaskScheduler
     _SCHEDULER_AVAILABLE = True
-except Exception:  # noqa: BLE001
+except Exception:
     _SCHEDULER_AVAILABLE = False
 
 logging.basicConfig(
@@ -65,88 +47,22 @@ log = logging.getLogger("jarvis-discord")
 
 DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 CHANNEL_NAME      = os.environ.get("DISCORD_CHANNEL_NAME", "jarvis")
-COMMAND_PREFIX    = os.environ.get("DISCORD_PREFIX", "!ask")
 DEFAULT_CITY      = os.environ.get("DEFAULT_WEATHER_CITY", "")
-GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_REPO       = os.environ.get("GITHUB_REPO", "")
 MEMORY_DB_PATH    = os.environ.get("MEMORY_DB_PATH", "/data/memory.db")
-# Optional: set to your server's ID for instant slash-command sync on startup.
-# Leave blank to use global sync (takes up to 1 hour to propagate).
-_GUILD_ID_STR     = os.environ.get("DISCORD_GUILD_ID", "")
+DISCORD_WEBHOOK   = os.environ.get("DISCORD_DIGEST_WEBHOOK", "")
+OLLAMA_HOST       = os.environ.get("OLLAMA_HOST", "http://host.docker.internal:11434")
+
+_GUILD_ID_STR    = os.environ.get("DISCORD_GUILD_ID", "")
 DISCORD_GUILD_ID: int | None = int(_GUILD_ID_STR) if _GUILD_ID_STR.isdigit() else None
-MAX_MSG_LEN       = 1990
-THREAD_HISTORY    = 12
+
+MAX_MSG_LEN   = 1990
+THREAD_HISTORY = 12
 
 # ── Thread pool ───────────────────────────────────────────────────────────────
 
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="jarvis-ask")
 
-# ── Command registry ──────────────────────────────────────────────────────────
-
-class _Entry:
-    __slots__ = ("fn", "desc", "usage")
-    def __init__(self, fn: Callable, desc: str, usage: str):
-        self.fn    = fn
-        self.desc  = desc
-        self.usage = usage
-
-
-class CommandRegistry:
-    """
-    Decorator-based Discord command dispatcher.
-
-    Usage:
-        @cmd.exact("!status", "show engine stats")
-        async def _(message): ...
-
-        @cmd.prefix("!weather", "!weather <city>", "weather forecast")
-        async def _(message, arg): ...
-
-    Adding a command requires only a decorated function — no changes to the
-    event loop or dispatch table.
-    """
-    def __init__(self) -> None:
-        self._exact:  dict[str, _Entry] = {}
-        self._prefix: dict[str, _Entry] = {}
-
-    def exact(self, command: str, description: str = "") -> Callable:
-        """Register a handler that matches a message exactly."""
-        def decorator(fn: Callable) -> Callable:
-            self._exact[command.lower()] = _Entry(fn, description, command)
-            return fn
-        return decorator
-
-    def prefix(self, command: str, usage: str = "", description: str = "") -> Callable:
-        """Register a handler that matches messages starting with command."""
-        def decorator(fn: Callable) -> Callable:
-            self._prefix[command.lower()] = _Entry(fn, description, usage or command)
-            return fn
-        return decorator
-
-    async def dispatch(
-        self, message: discord.Message, content: str, lower: str
-    ) -> bool:
-        """Try to dispatch message to a registered command. Returns True if handled."""
-        if lower in self._exact:
-            await self._exact[lower].fn(message)
-            return True
-        for key, entry in self._prefix.items():
-            if lower.startswith(key):
-                arg = content[len(key):].strip()
-                await entry.fn(message, arg)
-                return True
-        return False
-
-    def help_lines(self) -> list[tuple[str, str]]:
-        """Return (usage, description) pairs for all registered commands."""
-        lines = [(e.usage, e.desc) for e in self._exact.values()]
-        lines += [(e.usage, e.desc) for e in self._prefix.values()]
-        return sorted(lines, key=lambda x: x[0])
-
-
-cmd = CommandRegistry()
-
-# ── Jarvis SDK + dynamic tool discovery ──────────────────────────────────────
+# ── Jarvis SDK + tool discovery ───────────────────────────────────────────────
 
 log.info("Initialising Jarvis SDK...")
 from openjarvis import Jarvis  # noqa: E402
@@ -154,41 +70,25 @@ from openjarvis import Jarvis  # noqa: E402
 _jarvis: Jarvis | None = None
 _jarvis_lock = threading.Lock()
 
-# Baseline tools — always included even if registry discovery fails
 _BASELINE_TOOLS = [
     "think", "calculator", "retrieval", "web_search",
     "url_fetch", "arxiv_search", "weather", "system_monitor",
     "file_read", "memory_store", "memory_search",
-    "gemini_escalate", "github_issue", "github_merge",
+    "gemini_escalate", "pdf_tool", "code_interpreter",
 ]
-
-# Extra tools from AGENT_EXTRA_TOOLS env var (comma-separated) let operators
-# add tools without rebuilding the image:  AGENT_EXTRA_TOOLS=my_tool,another_tool
 _EXTRA_TOOLS = [
     t.strip() for t in os.environ.get("AGENT_EXTRA_TOOLS", "").split(",") if t.strip()
 ]
 
 
 def _discover_agent_tools() -> list[str]:
-    """
-    Build the agent tool list by unioning:
-      1. Baseline tools (hardcoded safe set)
-      2. Extra tools from AGENT_EXTRA_TOOLS env var
-      3. All tools currently registered in ToolRegistry
-
-    Any tool in the registry but not in the baseline/extra lists is still
-    included — this means MCP adapter tools and any future tools appear
-    automatically once registered.
-    """
     try:
         from openjarvis.core.registry import ToolRegistry
         registered = set(ToolRegistry.keys())
     except Exception:
         registered = set()
-
-    combined = set(_BASELINE_TOOLS) | set(_EXTRA_TOOLS) | registered
-    # Remove known-dangerous tools from the agent's reach in Discord context
     _BLOCKED = {"shell_exec", "code_interpreter_docker", "repl"}
+    combined = set(_BASELINE_TOOLS) | set(_EXTRA_TOOLS) | registered
     return sorted(combined - _BLOCKED)
 
 
@@ -201,11 +101,9 @@ def _get_jarvis() -> Jarvis:
     return _jarvis
 
 
-# Pre-warm
 threading.Thread(target=_get_jarvis, daemon=True).start()
 
-# Discover tools at startup (re-evaluated each time _discover_agent_tools is called)
-AGENT_TOOLS: list[str] = _BASELINE_TOOLS  # set properly after SDK warms up
+AGENT_TOOLS: list[str] = _BASELINE_TOOLS
 
 
 def _refresh_agent_tools() -> None:
@@ -216,32 +114,24 @@ def _refresh_agent_tools() -> None:
 
 threading.Thread(target=_refresh_agent_tools, daemon=True).start()
 
-# ── Task Scheduler ────────────────────────────────────────────────────────────
+# ── Scheduler ─────────────────────────────────────────────────────────────────
 
 SCHEDULER_DB_PATH = os.environ.get("SCHEDULER_DB_PATH", "/data/scheduler.db")
-
 _scheduler: "TaskScheduler | None" = None
 
 
-DISCORD_WEBHOOK = os.environ.get("DISCORD_DIGEST_WEBHOOK", "")
-
-
 def _post_task_result_to_discord(payload: dict) -> None:
-    """EventBus subscriber — posts scheduler task results to the Discord webhook."""
     if not DISCORD_WEBHOOK:
         return
-    task_id  = payload.get("task_id", "?")[:8]
-    success  = payload.get("success", False)
-    result   = (payload.get("result") or "").strip()
-    error    = (payload.get("error") or "").strip()
-
+    task_id = payload.get("task_id", "?")[:8]
+    success = payload.get("success", False)
+    result  = (payload.get("result") or "").strip()
+    error   = (payload.get("error") or "").strip()
     if not result and not error:
-        return  # Nothing worth posting
-
+        return
     icon    = "✅" if success else "❌"
     content = result[:1800] if success else f"Task failed:\n```\n{error[:500]}\n```"
     body    = f"{icon} **Scheduled task `{task_id}` complete**\n\n{content}"
-
     try:
         httpx.post(DISCORD_WEBHOOK, json={"content": body}, timeout=10)
     except Exception as exc:
@@ -249,14 +139,11 @@ def _post_task_result_to_discord(payload: dict) -> None:
 
 
 def _init_scheduler() -> None:
-    """Start the TaskScheduler, wire EventBus posting, and seed default tasks."""
     global _scheduler
     if not _SCHEDULER_AVAILABLE:
         log.warning("TaskScheduler not available — skipping scheduler init")
         return
-
     try:
-        # Try to get the EventBus from the Jarvis instance for event-driven posting
         bus = None
         try:
             from openjarvis.core.events import EventBus
@@ -270,7 +157,6 @@ def _init_scheduler() -> None:
         _scheduler.start()
         log.info("TaskScheduler started (db=%s)", SCHEDULER_DB_PATH)
 
-        # Seed default tasks — deduplicate by seed_id in metadata
         existing = {t.metadata.get("seed_id") for t in _scheduler.list_tasks()}
 
         def _seed(seed_id: str, **kwargs: Any) -> None:
@@ -278,9 +164,8 @@ def _init_scheduler() -> None:
                 meta = kwargs.pop("metadata", {})
                 meta["seed_id"] = seed_id
                 _scheduler.create_task(metadata=meta, **kwargs)  # type: ignore[union-attr]
-                log.info("Seeded scheduled task: %s", seed_id)
+                log.info("Seeded task: %s", seed_id)
 
-        # Daily morning brief at 09:00 UTC
         _seed(
             "morning-brief-daily",
             prompt=(
@@ -292,35 +177,21 @@ def _init_scheduler() -> None:
             schedule_value="0 9 * * *",
             agent="orchestrator",
             tools="weather,web_search,think,retrieval",
-            metadata={
-                "system_prompt": (
-                    "You are producing a concise morning brief. Be direct and informative. "
-                    "Lead with weather, follow with one key AI story, close with one insight."
-                ),
-            },
+            metadata={"system_prompt": "Produce a concise morning brief. Lead with weather, then one AI story, close with an insight."},
         )
-
-        # Weekly AI research digest — Monday 10:00 UTC
         _seed(
             "weekly-ai-digest",
             prompt=(
                 "Research and synthesise the most significant AI/ML developments from the past week. "
-                "Use web_search and arxiv_search. Produce a structured digest: breakthroughs, "
-                "notable papers, tooling updates, and one practical takeaway. "
-                "Store tagged 'weekly_digest:ai' in memory."
+                "Use web_search and arxiv_search. Produce a digest: breakthroughs, notable papers, "
+                "tooling updates, and one practical takeaway. Store tagged 'weekly_digest:ai'."
             ),
             schedule_type="cron",
             schedule_value="0 10 * * 1",
             agent="orchestrator",
             tools="web_search,arxiv_search,think,retrieval",
-            metadata={
-                "system_prompt": (
-                    "You are producing a weekly AI research digest. "
-                    "Be comprehensive but concise. Cite sources where possible."
-                ),
-            },
+            metadata={"system_prompt": "Produce a weekly AI research digest. Be comprehensive but concise. Cite sources."},
         )
-
     except Exception as exc:
         log.error("Scheduler init failed: %s", exc)
 
@@ -329,7 +200,6 @@ def _init_scheduler() -> None:
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.reactions       = True
 client = discord.Client(intents=intents)
 tree   = discord.app_commands.CommandTree(client)
 
@@ -338,8 +208,7 @@ tree   = discord.app_commands.CommandTree(client)
 def _user_prefix(user_id: int, display_name: str) -> str:
     return (
         f"[Discord User: {display_name} | ID: {user_id}]\n"
-        f"Tag any memory stores with 'user:{user_id}:' in the metadata/source "
-        f"field so they can be retrieved specifically for this user.\n\n"
+        f"Tag any memory stores with 'user:{user_id}:' in the source/metadata field.\n\n"
     )
 
 
@@ -353,11 +222,18 @@ def _search_user_memory(query: str, user_id: int) -> list[dict]:
         cur = conn.cursor()
         uid_filter = f"%user:{user_id}%"
         try:
-            cur.execute(
-                "SELECT content, source FROM memories_fts "
-                "WHERE memories_fts MATCH ? AND (source LIKE ? OR metadata LIKE ?) LIMIT 8",
-                (query, uid_filter, uid_filter),
-            )
+            if query:
+                cur.execute(
+                    "SELECT content, source FROM memories_fts "
+                    "WHERE memories_fts MATCH ? AND (source LIKE ? OR metadata LIKE ?) LIMIT 8",
+                    (query, uid_filter, uid_filter),
+                )
+            else:
+                cur.execute(
+                    "SELECT content, source FROM memories "
+                    "WHERE source LIKE ? OR metadata LIKE ? LIMIT 20",
+                    (uid_filter, uid_filter),
+                )
         except sqlite3.OperationalError:
             cur.execute(
                 "SELECT content, source FROM memories "
@@ -372,10 +248,10 @@ def _search_user_memory(query: str, user_id: int) -> list[dict]:
         log.debug("Memory search error: %s", exc)
         return []
 
+
 # ── Core agent call ───────────────────────────────────────────────────────────
 
 def _current_date_prefix() -> str:
-    """Return a date/time context line to prepend to every query."""
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
     return (
@@ -390,37 +266,30 @@ def _run_ask(
     user_id: int | None = None,
     display_name: str = "User",
     thread_history: str = "",
+    agent: str = "orchestrator",
 ) -> str:
-    """Synchronous Jarvis call in thread pool. Includes user prefix + thread context."""
     j = _get_jarvis()
-
     parts: list[str] = [_current_date_prefix()]
     if user_id is not None:
         parts.append(_user_prefix(user_id, display_name))
     if thread_history:
         parts.append(
-            f"[Thread conversation history — use for context]\n{thread_history}\n\n"
+            f"[Thread history]\n{thread_history}\n\n"
             f"[Current message from {display_name}]\n"
         )
     parts.append(query)
     full_query = "".join(parts)
-
     try:
-        result = j.ask(full_query, agent="orchestrator", tools=AGENT_TOOLS)
+        result = j.ask(full_query, agent=agent, tools=AGENT_TOOLS)
         if isinstance(result, dict):
             return result.get("content") or "(no response)"
         return str(result) or "(no response)"
     except Exception as exc:
         log.exception("Jarvis.ask failed: %s", exc)
-        return (
-            f"⚠️ Jarvis encountered an error: `{exc}`\n"
-            "The local agent will open a GitHub issue if this is a recurring problem."
-        )
+        return f"⚠️ Agent error: `{exc}`"
 
-# ── Direct tool shortcuts (bypass agent for speed-sensitive commands) ─────────
 
 def _call_tool(name: str, **kwargs: Any) -> str | None:
-    """Call a registered tool directly. Returns content string or None on failure."""
     try:
         from openjarvis.core.registry import ToolRegistry
         tool = ToolRegistry.get(name)
@@ -432,53 +301,11 @@ def _call_tool(name: str, **kwargs: Any) -> str | None:
         log.debug("Direct tool call %r failed: %s", name, exc)
         return None
 
-# ── GitHub helpers (reaction approval) ───────────────────────────────────────
-
-def _gh_headers() -> dict[str, str]:
-    return {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-
-def _add_work_label(issue_number: int) -> None:
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        return
-    try:
-        r = httpx.get(
-            f"https://api.github.com/repos/{GITHUB_REPO}/issues/{issue_number}",
-            headers=_gh_headers(), timeout=10,
-        )
-        current = {lbl["name"] for lbl in r.json().get("labels", [])}
-        current.add("claude-code-work")
-        httpx.patch(
-            f"https://api.github.com/repos/{GITHUB_REPO}/issues/{issue_number}",
-            headers=_gh_headers(), json={"labels": list(current)}, timeout=10,
-        )
-    except Exception as exc:
-        log.warning("Label add failed for #%d: %s", issue_number, exc)
-
-
-def _close_issue(issue_number: int) -> None:
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        return
-    try:
-        httpx.patch(
-            f"https://api.github.com/repos/{GITHUB_REPO}/issues/{issue_number}",
-            headers=_gh_headers(), json={"state": "closed"}, timeout=10,
-        )
-    except Exception as exc:
-        log.warning("Issue close failed for #%d: %s", issue_number, exc)
-
-
-def _extract_issue_number(text: str) -> int | None:
-    m = re.search(r"github\.com/[^/\s]+/[^/\s]+/issues/(\d+)", text)
-    return int(m.group(1)) if m else None
 
 # ── Discord helpers ───────────────────────────────────────────────────────────
 
 def extract_query(message: discord.Message) -> str | None:
+    """Extract query from a message in #jarvis or @mention."""
     content = message.content.strip()
     if client.user and client.user.mentioned_in(message):
         return (
@@ -487,8 +314,6 @@ def extract_query(message: discord.Message) -> str | None:
             .replace(f"<@!{client.user.id}>", "")
             .strip() or None
         )
-    if content.lower().startswith(COMMAND_PREFIX.lower()):
-        return content[len(COMMAND_PREFIX):].strip() or None
     if hasattr(message.channel, "name") and message.channel.name == CHANNEL_NAME:
         return content or None
     if isinstance(message.channel, discord.Thread):
@@ -535,15 +360,9 @@ async def send_chunked(dest: discord.abc.Messageable, text: str) -> None:
 
 
 async def reply_long(message: discord.Message, text: str, thread_name: str) -> None:
-    """Send a long reply, creating a thread if in a text channel."""
-    if (
-        isinstance(message.channel, discord.TextChannel)
-        and len(text) > MAX_MSG_LEN
-    ):
+    if isinstance(message.channel, discord.TextChannel) and len(text) > MAX_MSG_LEN:
         try:
-            thread = await message.create_thread(
-                name=thread_name[:99], auto_archive_duration=60
-            )
+            thread = await message.create_thread(name=thread_name[:99], auto_archive_duration=60)
             await send_chunked(thread, text)
             return
         except discord.Forbidden:
@@ -551,409 +370,399 @@ async def reply_long(message: discord.Message, text: str, thread_name: str) -> N
     await send_chunked(message.channel, text)
 
 
-# ── Slash-command helper ─────────────────────────────────────────────────────
-
 async def _slash_reply(
     interaction: discord.Interaction,
     fn: "Callable[[], str]",
     thread_name: str = "",
 ) -> None:
-    """Defer an interaction, run fn in the thread pool, and send the reply.
-
-    For long replies in a text channel, creates a thread to avoid flooding.
-    Always safe to call regardless of reply length.
-    """
     await interaction.response.defer(thinking=True)
     loop  = asyncio.get_event_loop()
     reply = await loop.run_in_executor(_executor, fn)
-
     if (
         thread_name
         and len(reply) > MAX_MSG_LEN
         and isinstance(interaction.channel, discord.TextChannel)
     ):
         try:
-            seed = await interaction.followup.send(f"*{thread_name}*", wait=True)
-            thread = await seed.create_thread(
-                name=thread_name[:99], auto_archive_duration=60
-            )
+            seed   = await interaction.followup.send(f"*{thread_name}*", wait=True)
+            thread = await seed.create_thread(name=thread_name[:99], auto_archive_duration=60)
             await send_chunked(thread, reply)
             return
         except discord.Forbidden:
             pass
-
-    # Chunked plain reply
     chunks = [reply[i : i + MAX_MSG_LEN] for i in range(0, max(len(reply), 1), MAX_MSG_LEN)]
     for chunk in chunks:
         await interaction.followup.send(chunk)
 
 
-# ── Registered commands ───────────────────────────────────────────────────────
-
-@cmd.exact("!status", "engine, model, and host stats")
-async def _(message: discord.Message) -> None:
-    loop = asyncio.get_event_loop()
-
-    def _status() -> str:
-        try:
-            j   = _get_jarvis()
-            cfg = j._config  # type: ignore[attr-defined]
-            model  = getattr(cfg.intelligence, "default_model", "?")
-            engine = getattr(cfg.intelligence, "preferred_engine", "?")
-        except Exception:
-            model, engine = "?", "?"
-        sys_info = _call_tool("system_monitor") or "system_monitor unavailable"
-        gemini_ok = bool(os.environ.get("GEMINI_API_KEY"))
-        github_ok = bool(GITHUB_TOKEN and GITHUB_REPO)
-        return (
-            f"**Jarvis Status**\n```\n"
-            f"Local model : {model} ({engine})\n"
-            f"Gemini      : {'✓ configured' if gemini_ok else '✗ not set'}\n"
-            f"GitHub      : {'✓ ' + GITHUB_REPO if github_ok else '✗ not set'}\n"
-            f"Tools loaded: {len(AGENT_TOOLS)}\n"
-            f"```\n{sys_info}"
-        )
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _status)
-    await send_chunked(message.channel, reply)
+def _resolve_task(task_id: str) -> "tuple[Any | None, str]":
+    if _scheduler is None:
+        return None, "Scheduler is not running."
+    matches = [t for t in _scheduler.list_tasks() if t.id.startswith(task_id)]
+    if not matches:
+        return None, f"No task found with id starting `{task_id}`. Run `/tasks` to list."
+    if len(matches) > 1:
+        ids = ", ".join(t.id[:8] for t in matches)
+        return None, f"Multiple tasks match `{task_id}`: {ids}"
+    return matches[0], ""
 
 
-@cmd.exact("!help", "show all commands")
-async def _(message: discord.Message) -> None:
-    lines = ["**Jarvis commands**", "```"]
-    lines.append(f"  {'In #' + CHANNEL_NAME:<26} just type — no prefix needed")
-    lines.append(f"  {'@Jarvis <query>':<26} mention anywhere")
-    lines.append(f"  {COMMAND_PREFIX + ' <query>':<26} explicit prefix")
-    lines.append("")
-    for usage, desc in cmd.help_lines():
-        if desc:
-            lines.append(f"  {usage:<26} {desc}")
-    lines.append("```")
-    lines.append(
-        "Local model primary · Gemini Flash mid-tier · Claude Code final escalation.\n"
-        "React **👍** to approve proposals · **👎** to withdraw."
+# ── Slash commands ────────────────────────────────────────────────────────────
+# Everything is a /slash command. Free-form text in #jarvis also works.
+
+_Choice = discord.app_commands.Choice
+
+
+# ── Conversation ──────────────────────────────────────────────────────────────
+
+@tree.command(name="ask", description="Ask Jarvis anything")
+@discord.app_commands.describe(query="Your question or task")
+async def slash_ask(interaction: discord.Interaction, query: str) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
+    await _slash_reply(
+        interaction,
+        lambda: _run_ask(query, uid, name),
+        thread_name=f"Jarvis: {query[:50]}",
     )
-    await message.channel.send("\n".join(lines))
 
 
-@cmd.exact("!tools", "list all registered agent tools")
-async def _(message: discord.Message) -> None:
-    loop  = asyncio.get_event_loop()
-    tools = await loop.run_in_executor(_executor, _discover_agent_tools)
-    lines = ["**Registered Agent Tools**", "```"]
-    for t in tools:
-        lines.append(f"  {t}")
-    lines.append("```")
-    lines.append(
-        "*Add a tool: create `src/openjarvis/tools/my_tool.py`, register with "
-        "`@ToolRegistry.register(\"name\")`, import in `tools/__init__.py`.*"
+@tree.command(name="agent", description="Run a task with the full OrchestratorAgent and all tools")
+@discord.app_commands.describe(task="What you want the agent to do")
+async def slash_agent(interaction: discord.Interaction, task: str) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
+    await _slash_reply(
+        interaction,
+        lambda: _run_ask(task, uid, name),
+        thread_name=f"Agent: {task[:50]}",
     )
-    await send_chunked(message.channel, "\n".join(lines))
 
 
-@cmd.exact("!mcp", "show MCP server status")
-async def _(message: discord.Message) -> None:
-    """List configured MCP servers and whether they're reachable."""
-    try:
-        j   = _get_jarvis()
-        cfg = j._config  # type: ignore[attr-defined]
-        mcp_cfg = getattr(cfg, "tools", None)
-        mcp_cfg = getattr(mcp_cfg, "mcp", None) if mcp_cfg else None
-        enabled = getattr(mcp_cfg, "enabled", False) if mcp_cfg else False
-        servers = getattr(mcp_cfg, "servers", []) if mcp_cfg else []
-    except Exception:
-        enabled, servers = False, []
-
-    if not enabled:
-        await message.channel.send(
-            "MCP is disabled. To enable: set `[tools.mcp] enabled = true` in "
-            "`config.persistent.toml` and add `[[tools.mcp.servers]]` entries."
-        )
-        return
-
-    if not servers:
-        await message.channel.send(
-            "MCP is enabled but no servers are configured.\n"
-            "Add servers to `config.persistent.toml`:\n"
-            "```toml\n[[tools.mcp.servers]]\n"
-            "name = \"filesystem\"\n"
-            "command = [\"npx\", \"-y\", \"@modelcontextprotocol/server-filesystem\", \"/data\"]\n```"
-        )
-        return
-
-    lines = ["**MCP Servers**", "```"]
-    for s in servers:
-        name = getattr(s, "name", str(s))
-        lines.append(f"  {name}")
-    lines.append("```")
-    await message.channel.send("\n".join(lines))
+@tree.command(name="react", description="Run a task with NativeReActAgent — shows Thought/Action/Observation reasoning")
+@discord.app_commands.describe(task="Task to reason through step-by-step")
+async def slash_react(interaction: discord.Interaction, task: str) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
+    await _slash_reply(
+        interaction,
+        lambda: _run_ask(task, uid, name, agent="native_react"),
+        thread_name=f"ReAct: {task[:50]}",
+    )
 
 
-@cmd.exact("!skills", "list available Jarvis skills")
-async def _(message: discord.Message) -> None:
-    loop = asyncio.get_event_loop()
-
-    def _skills() -> str:
+@tree.command(name="ask-gemini", description="Ask Google Gemini Flash directly, bypassing the local model")
+@discord.app_commands.describe(question="Question for Gemini")
+async def slash_ask_gemini(interaction: discord.Interaction, question: str) -> None:
+    def _gemini() -> str:
+        api_key = os.environ.get("GEMINI_API_KEY", "")
+        if not api_key:
+            return "⚠️ GEMINI_API_KEY is not configured."
         try:
-            from openjarvis.skills.loader import SkillLoader
-            skills = SkillLoader().list_skills()
-            if skills:
-                lines = ["**Jarvis Skills**", "```"]
-                for s in sorted(skills, key=lambda x: x.get("name", "")):
-                    lines.append(f"  {s.get('name','?'):<28} {s.get('description','')[:55]}")
-                lines.append("```")
-                return "\n".join(lines)
-        except Exception:
-            pass
-        return (
-            "**Jarvis Skills**\n```\n"
-            "  deep-research            Multi-search synthesis with citations\n"
-            "  morning-brief            Weather + AI story + daily insight\n"
-            "  topic-research           Research + store to memory\n"
-            "  web-summarize            Summarise a web page\n"
-            "  code-lint                Lint and review code\n"
-            "  data-analyze             Analyse and interpret data\n"
-            "```"
-        )
+            from openjarvis.tools.gemini_escalate import gemini_generate
+            return f"**Gemini Flash** says:\n\n{gemini_generate(question)}"
+        except Exception as exc:
+            return f"⚠️ Gemini call failed: {exc}"
 
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _skills)
-    await send_chunked(message.channel, reply)
+    await _slash_reply(interaction, _gemini, thread_name=f"Gemini: {question[:50]}")
 
 
-@cmd.exact("!sysinfo", "host CPU/RAM/GPU stats (summary)")
-async def _(message: discord.Message) -> None:
-    loop = asyncio.get_event_loop()
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(
-            _executor, lambda: _call_tool("system_monitor") or "system_monitor unavailable"
-        )
-    await send_chunked(message.channel, reply)
+# ── Research & Information ────────────────────────────────────────────────────
 
-
-@cmd.exact("!sysinfo full", "host CPU/RAM/GPU stats (detailed)")
-async def _(message: discord.Message) -> None:
-    loop = asyncio.get_event_loop()
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(
-            _executor,
-            lambda: _call_tool("system_monitor", detail="full") or "system_monitor unavailable",
-        )
-    await send_chunked(message.channel, reply)
-
-
-@cmd.prefix("!weather", "!weather [city]", "current conditions + 3-day forecast")
-async def _(message: discord.Message, city: str) -> None:
-    city = city or DEFAULT_CITY
-    if not city:
-        await message.channel.send("Usage: `!weather <city>` — e.g. `!weather London`")
-        return
-    loop = asyncio.get_event_loop()
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(
-            _executor,
-            lambda: _call_tool("weather", city=city) or _run_ask(f"Weather in {city}?"),
-        )
-    await send_chunked(message.channel, reply)
-
-
-@cmd.prefix("!arxiv ", "!arxiv <query>", "search recent arXiv papers")
-async def _(message: discord.Message, query: str) -> None:
-    if not query:
-        await message.channel.send("Usage: `!arxiv <search query>`")
-        return
-    loop = asyncio.get_event_loop()
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(
-            _executor,
-            lambda: _call_tool("arxiv_search", query=query, max_results=8)
-                    or _run_ask(f"Search arXiv for: {query}"),
-        )
-    await reply_long(message, reply, f"arXiv: {query[:50]}")
-
-
-@cmd.prefix("!summarize ", "!summarize <url>", "fetch and summarise a web page")
-async def _(message: discord.Message, url: str) -> None:
-    if not url:
-        await message.channel.send("Usage: `!summarize <url>`")
-        return
-
-    loop = asyncio.get_event_loop()
-
-    def _summarize() -> str:
-        raw = _call_tool("url_fetch", url=url, max_chars=6000)
-        if raw:
-            return _run_ask(
-                f"Summarise this web page concisely. Extract key points and main argument.\n\n"
-                f"URL: {url}\n\n{raw}"
-            )
-        return _run_ask(
-            f"Fetch and summarise this URL using the url_fetch tool: {url}"
-        )
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _summarize)
-    await reply_long(message, reply, f"Summary: {url[:60]}")
-
-
-@cmd.prefix("!research ", "!research <topic>", "multi-source research synthesis")
-async def _(message: discord.Message, topic: str) -> None:
-    if not topic:
-        await message.channel.send("Usage: `!research <topic>`")
-        return
-    user_id      = message.author.id
-    display_name = message.author.display_name
-    loop         = asyncio.get_event_loop()
+@tree.command(name="research", description="Multi-source research synthesis stored to your memory")
+@discord.app_commands.describe(topic="What to research")
+async def slash_research(interaction: discord.Interaction, topic: str) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
 
     def _research() -> str:
         return _run_ask(
             f"Research '{topic}' thoroughly.\n"
-            "1. Use web_search (at least 2 angles).\n"
-            "2. Use arxiv_search if it's technical/scientific.\n"
+            "1. Use web_search with at least 2 different angles.\n"
+            "2. Use arxiv_search if technical/scientific.\n"
             "3. Check retrieval for prior memory context.\n"
-            "4. Synthesise a structured report: Overview, Key Concepts, "
-            "Recent Developments, Practical Applications, Key Takeaways.\n"
-            f"5. Store findings tagged with 'user:{user_id}:research:{topic[:30]}'.",
-            user_id, display_name,
+            "4. Synthesise: Overview, Key Concepts, Recent Developments, "
+            "Practical Applications, Key Takeaways.\n"
+            f"5. Store findings tagged 'user:{uid}:research:{topic[:30]}'.",
+            uid, name,
         )
 
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _research)
-    await reply_long(message, reply, f"Research: {topic[:50]}")
+    await _slash_reply(interaction, _research, thread_name=f"Research: {topic[:50]}")
 
 
-@cmd.prefix("!memory ", "!memory <query>", "search your personal memory store")
-async def _(message: discord.Message, query: str) -> None:
-    if not query:
-        await message.channel.send("Usage: `!memory <search terms>`")
-        return
-    user_id = message.author.id
-    loop    = asyncio.get_event_loop()
+@tree.command(name="deep-dive", description="Thorough 15-turn research with arXiv + web, saved to memory")
+@discord.app_commands.describe(topic="Topic for deep research")
+async def slash_deep_dive(interaction: discord.Interaction, topic: str) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
+    await interaction.response.defer(thinking=True)
+    await interaction.followup.send(
+        f"Starting deep research on **{topic}**…\n"
+        "Running up to 15 agent turns with web search + arXiv. Results saved to your memory."
+    )
+    loop  = asyncio.get_event_loop()
+    reply = await loop.run_in_executor(
+        _executor,
+        lambda: _run_ask(
+            f"Comprehensive deep research on: '{topic}'\n\n"
+            "Strategy: web_search (3+ angles), arxiv_search, url_fetch (2-3 key sources), "
+            f"think to synthesise, memory_store tagged 'user:{uid}:deepdive:{topic[:25]}'.\n\n"
+            "Output: Executive Summary, Key Findings (with sources), Technical Details, "
+            "Recent Developments, Open Questions, Key Sources.",
+            uid, name,
+        ),
+    )
+    chunks = [reply[i : i + MAX_MSG_LEN] for i in range(0, max(len(reply), 1), MAX_MSG_LEN)]
+    for chunk in chunks:
+        await interaction.followup.send(chunk)
 
-    def _mem() -> str:
-        rows = _search_user_memory(query, user_id)
-        if not rows:
-            return (
-                f"No memories found for '{query}'.\n"
-                "Chat with Jarvis and it will build up your memory store over time."
+
+@tree.command(name="summarize", description="Fetch and summarise a web page")
+@discord.app_commands.describe(url="URL to summarise")
+async def slash_summarize(interaction: discord.Interaction, url: str) -> None:
+    def _summarize() -> str:
+        raw = _call_tool("url_fetch", url=url, max_chars=6000)
+        if raw:
+            return _run_ask(f"Summarise this page. Key points and main argument.\n\nURL: {url}\n\n{raw}")
+        return _run_ask(f"Fetch and summarise: {url}")
+
+    await _slash_reply(interaction, _summarize, thread_name=f"Summary: {url[:60]}")
+
+
+@tree.command(name="pdf", description="Extract and summarise a PDF from a URL")
+@discord.app_commands.describe(url="URL of the PDF")
+async def slash_pdf(interaction: discord.Interaction, url: str) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
+
+    def _pdf() -> str:
+        result = _call_tool("pdf_tool", url=url)
+        if result:
+            return _run_ask(
+                f"Summarise this PDF content from {url}:\n\n{result[:6000]}\n\n"
+                "Provide: key points, main argument, important figures/tables if any.",
+                uid, name,
             )
-        lines = [f"**Memory results for '{query}'** ({len(rows)})\n"]
-        for i, r in enumerate(rows, 1):
-            lines.append(f"**{i}.** {r.get('content','')[:280]}")
-        return "\n\n".join(lines)
+        return _run_ask(
+            f"Use pdf_tool to extract and summarise the PDF at: {url}",
+            uid, name,
+        )
 
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _mem)
-    await send_chunked(message.channel, reply)
+    await _slash_reply(interaction, _pdf, thread_name=f"PDF: {url[:60]}")
 
 
-@cmd.exact("!digest now", "on-demand HN AI digest")
-async def _(message: discord.Message) -> None:
-    await message.channel.send("Fetching HN AI digest…")
-    loop = asyncio.get_event_loop()
+@tree.command(name="arxiv", description="Search recent arXiv papers")
+@discord.app_commands.describe(query="Search query")
+async def slash_arxiv(interaction: discord.Interaction, query: str) -> None:
+    await _slash_reply(
+        interaction,
+        lambda: _call_tool("arxiv_search", query=query, max_results=8)
+                or _run_ask(f"Search arXiv for: {query}"),
+        thread_name=f"arXiv: {query[:50]}",
+    )
 
+
+@tree.command(name="papers", description="Latest AI/ML arXiv papers (or specify a topic)")
+@discord.app_commands.describe(topic="Topic (leave blank for general AI/ML)")
+async def slash_papers(interaction: discord.Interaction, topic: str = "") -> None:
+    query = topic or "LLM AI agent reasoning alignment"
+    await _slash_reply(
+        interaction,
+        lambda: _call_tool("arxiv_search", query=query, max_results=8, sort_by="submittedDate")
+                or _run_ask(f"Latest arXiv papers on: {query}"),
+        thread_name=f"arXiv: {query[:50]}",
+    )
+
+
+@tree.command(name="weather", description="Current conditions + 3-day forecast")
+@discord.app_commands.describe(city="City name (leave blank for default)")
+async def slash_weather(interaction: discord.Interaction, city: str = "") -> None:
+    city = city or DEFAULT_CITY
+    if not city:
+        await interaction.response.send_message(
+            "Set a default city in `.env` (`DEFAULT_WEATHER_CITY`) or provide one: `/weather city:London`",
+            ephemeral=True,
+        )
+        return
+    await _slash_reply(
+        interaction,
+        lambda: _call_tool("weather", city=city) or _run_ask(f"Weather in {city}?"),
+    )
+
+
+@tree.command(name="brief", description="Morning brief: weather + top AI story + daily insight")
+async def slash_brief(interaction: discord.Interaction) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
+
+    def _brief() -> str:
+        city    = DEFAULT_CITY or "New York"
+        weather = _call_tool("weather", city=city) or ""
+        return _run_ask(
+            f"Give me a concise morning brief:\n"
+            f"1. **Weather** — summarise: {weather[:300]}\n"
+            f"2. **Top AI Story** — use web_search, 3 sentences.\n"
+            f"3. **Insight** — one thought-provoking question for today.\n"
+            f"Keep it concise and useful.",
+            uid, name,
+        )
+
+    await _slash_reply(interaction, _brief, thread_name="Morning Brief")
+
+
+@tree.command(name="digest", description="On-demand Hacker News AI digest (last 72h)")
+async def slash_digest(interaction: discord.Interaction) -> None:
     def _digest() -> str:
         return _run_ask(
-            "Fetch the top 10 most-discussed AI/ML stories on Hacker News from "
-            "the last 72 hours. Use web_search. For each: rank, title (as a link), "
-            "comment count, score, one-sentence description. "
+            "Fetch the top 10 most-discussed AI/ML stories on Hacker News from the last 72 hours. "
+            "Use web_search. For each: rank, title (as a link), comment count, score, one-sentence description. "
             "Format as a numbered Discord-friendly list."
         )
 
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _digest)
-    await reply_long(message, reply, "HN AI Digest (on-demand)")
+    await _slash_reply(interaction, _digest, thread_name="HN AI Digest")
 
 
-@cmd.prefix("!propose ", "!propose <idea>", "submit a feature proposal to GitHub")
-async def _(message: discord.Message, idea: str) -> None:
-    if not idea:
-        await message.channel.send("Usage: `!propose <your feature idea>`")
-        return
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        await message.channel.send(
-            "⚠️ GITHUB_TOKEN and GITHUB_REPO must be set to submit proposals."
-        )
-        return
-
-    user_id      = message.author.id
-    display_name = message.author.display_name
-    await message.channel.send(
-        "Analysing proposal, consulting Gemini if needed, and opening a GitHub issue…\n"
-        "React **👍** to approve it for Claude's queue, or **👎** to withdraw."
-    )
-    loop = asyncio.get_event_loop()
-
-    def _propose() -> str:
+@tree.command(name="trending", description="What's trending in AI and tech right now")
+async def slash_trending(interaction: discord.Interaction) -> None:
+    def _trending() -> str:
         return _run_ask(
-            f"Discord user {display_name} proposed this feature:\n\n```\n{idea}\n```\n\n"
-            "Steps:\n"
-            "1. Use gemini_escalate (mode=plan) to get a structured implementation plan "
-            "   for this feature. Pass the idea as the problem.\n"
-            "2. Use github_issue to submit the issue with:\n"
-            "   - A clear title (< 80 chars)\n"
-            "   - Gemini's implementation plan as the body\n"
-            "   - Acceptance criteria\n"
-            "3. Return the issue URL so the user can track and approve it.",
-            user_id, display_name,
+            "What's trending in AI and tech right now? Use web_search (multiple queries).\n\n"
+            "**Top stories this week** — 3-4 items with link + 1-sentence description.\n"
+            "**Hot tools/models** — 2-3 notable releases or demos.\n"
+            "**Worth watching** — 1-2 early-stage things gaining traction."
         )
 
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _propose)
-    await send_chunked(message.channel, reply)
+    await _slash_reply(interaction, _trending, thread_name="Trending in AI/Tech")
 
 
-# ── Memory commands ───────────────────────────────────────────────────────────
+# ── Knowledge ─────────────────────────────────────────────────────────────────
 
-@cmd.prefix("!remember ", "!remember <fact>", "store a fact to your personal memory")
-async def _(message: discord.Message, fact: str) -> None:
-    if not fact:
-        await message.channel.send("Usage: `!remember <fact or note>` — stores it to your memory.")
+@tree.command(name="explain", description="Explain a concept at three levels: simple, intermediate, expert")
+@discord.app_commands.describe(concept="What to explain")
+async def slash_explain(interaction: discord.Interaction, concept: str) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
+
+    def _explain() -> str:
+        return _run_ask(
+            f"Explain '{concept}' at three levels:\n\n"
+            "**Simple (ELI5):** 2-3 sentences anyone can understand.\n\n"
+            "**Intermediate:** 3-5 sentences with key concepts and how they connect.\n\n"
+            "**Expert:** 3-5 sentences with technical depth, edge cases, and nuance.\n\n"
+            "Use web_search if recent or technical. Be concise and concrete.",
+            uid, name,
+        )
+
+    await _slash_reply(interaction, _explain, thread_name=f"Explain: {concept[:50]}")
+
+
+@tree.command(name="compare", description="Structured comparison of two things")
+@discord.app_commands.describe(items="What to compare, e.g. 'PyTorch vs JAX'")
+async def slash_compare(interaction: discord.Interaction, items: str) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
+    if " vs " not in items.lower():
+        await interaction.response.send_message(
+            "Format: `/compare items:X vs Y` — e.g. `/compare items:PyTorch vs JAX`",
+            ephemeral=True,
+        )
         return
-    user_id      = message.author.id
-    display_name = message.author.display_name
-    loop         = asyncio.get_event_loop()
+
+    def _compare() -> str:
+        return _run_ask(
+            f"Compare {items}. Use web_search for current info.\n\n"
+            "**Overview:** one sentence each.\n"
+            "**Key differences:** 4-6 bullet points.\n"
+            "**When to use each:** 2-3 scenarios each.\n"
+            "**Verdict:** direct recommendation.",
+            uid, name,
+        )
+
+    await _slash_reply(interaction, _compare, thread_name=f"Compare: {items[:60]}")
+
+
+@tree.command(name="debate", description="Structured pros and cons analysis")
+@discord.app_commands.describe(topic="Topic or claim to analyse")
+async def slash_debate(interaction: discord.Interaction, topic: str) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
+
+    def _debate() -> str:
+        return _run_ask(
+            f"Analyse: '{topic}'. Use web_search for real arguments.\n\n"
+            "**For:** 3-4 bullet points with evidence.\n"
+            "**Against:** 3-4 bullet points with evidence.\n"
+            "**Nuance:** 1-2 caveats the debate often misses.\n"
+            "**Bottom line:** honest synthesis in 2-3 sentences.",
+            uid, name,
+        )
+
+    await _slash_reply(interaction, _debate, thread_name=f"Debate: {topic[:50]}")
+
+
+@tree.command(name="code", description="Run Python code or get a code answer with a live example")
+@discord.app_commands.describe(query="Code question or Python snippet to run")
+async def slash_code(interaction: discord.Interaction, query: str) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
+
+    def _code() -> str:
+        return _run_ask(
+            f"Answer this coding question or run this code using code_interpreter:\n\n"
+            f"```\n{query}\n```\n\n"
+            "If it's runnable Python, execute it and show the output. "
+            "If it's a question, write and run a minimal example. Show both code and result.",
+            uid, name,
+        )
+
+    await _slash_reply(interaction, _code, thread_name=f"Code: {query[:50]}")
+
+
+# ── Memory ────────────────────────────────────────────────────────────────────
+
+@tree.command(name="memory", description="Search your personal memory store")
+@discord.app_commands.describe(query="Search terms")
+async def slash_memory(interaction: discord.Interaction, query: str) -> None:
+    uid = interaction.user.id
+
+    def _mem() -> str:
+        rows = _search_user_memory(query, uid)
+        if not rows:
+            return f"No memories found for '{query}'.\nChat with Jarvis to build your memory store."
+        lines = [f"**Memory results for '{query}'** ({len(rows)})"]
+        for i, r in enumerate(rows, 1):
+            lines.append(f"**{i}.** {r.get('content', '')[:280]}")
+        return "\n\n".join(lines)
+
+    await _slash_reply(interaction, _mem)
+
+
+@tree.command(name="remember", description="Store a fact or note to your personal long-term memory")
+@discord.app_commands.describe(fact="The fact, note, or information to remember")
+async def slash_remember(interaction: discord.Interaction, fact: str) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
 
     def _remember() -> str:
         result = _call_tool(
             "memory_store",
             content=fact,
-            source=f"user:{user_id}:manual",
-            metadata={"user_id": str(user_id), "display_name": display_name},
+            source=f"user:{uid}:manual",
+            metadata={"user_id": str(uid), "display_name": name},
         )
         if result is not None:
             return f"✅ Remembered: _{fact[:200]}_"
-        # Fallback: let the agent do it
         return _run_ask(
-            f"Store this fact to long-term memory using memory_store. "
-            f"Set source to 'user:{user_id}:manual'.\n\nFact: {fact}",
-            user_id, display_name,
+            f"Store this to long-term memory using memory_store. "
+            f"Source: 'user:{uid}:manual'.\n\nFact: {fact}",
+            uid, name,
         )
 
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _remember)
-    await send_chunked(message.channel, reply)
+    await _slash_reply(interaction, _remember)
 
 
-@cmd.prefix("!forget ", "!forget <query>", "delete memories matching a query")
-async def _(message: discord.Message, query: str) -> None:
-    if not query:
-        await message.channel.send("Usage: `!forget <search terms>` — removes matching memories.")
-        return
-    user_id      = message.author.id
-    display_name = message.author.display_name
-    loop         = asyncio.get_event_loop()
+@tree.command(name="forget", description="Delete memories matching a query")
+@discord.app_commands.describe(query="Search terms for the memories to delete")
+async def slash_forget(interaction: discord.Interaction, query: str) -> None:
+    uid = interaction.user.id
 
     def _forget() -> str:
-        rows = _search_user_memory(query, user_id)
+        rows = _search_user_memory(query, uid)
         if not rows:
             return f"No memories found matching '{query}'."
         db = Path(MEMORY_DB_PATH)
         deleted = 0
         try:
             conn = sqlite3.connect(str(db), timeout=5)
-            uid_filter = f"%user:{user_id}%"
+            uid_filter = f"%user:{uid}%"
             cur = conn.cursor()
             for row in rows:
                 content = row.get("content", "")
@@ -971,43 +780,21 @@ async def _(message: discord.Message, query: str) -> None:
             return f"⚠️ Failed to delete memories: {exc}"
         return f"🗑️ Deleted {deleted} memor{'y' if deleted == 1 else 'ies'} matching '{query}'."
 
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _forget)
-    await send_chunked(message.channel, reply)
+    await _slash_reply(interaction, _forget)
 
 
-@cmd.exact("!whoami", "show what Jarvis knows about you from memory")
-async def _(message: discord.Message) -> None:
-    user_id      = message.author.id
-    display_name = message.author.display_name
-    loop         = asyncio.get_event_loop()
+@tree.command(name="whoami", description="Show everything Jarvis knows about you from memory")
+async def slash_whoami(interaction: discord.Interaction) -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
 
     def _whoami() -> str:
-        rows = _search_user_memory("", user_id)
-        # Broader search: get all user-tagged memories
-        db = Path(MEMORY_DB_PATH)
-        all_rows: list[dict] = []
-        try:
-            conn = sqlite3.connect(str(db), timeout=5)
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            uid_filter = f"%user:{user_id}%"
-            cur.execute(
-                "SELECT content, source FROM memories "
-                "WHERE source LIKE ? OR metadata LIKE ? LIMIT 20",
-                (uid_filter, uid_filter),
-            )
-            all_rows = [dict(r) for r in cur.fetchall()]
-            conn.close()
-        except Exception:
-            all_rows = rows
-
+        all_rows = _search_user_memory("", uid)
         if not all_rows:
             return (
-                f"I don't have any memories about you yet, {display_name}.\n"
-                "Chat with me, use `!remember`, or run `!research` on a topic to build your memory."
+                f"I don't have any memories about you yet, {name}.\n"
+                "Chat with me or use `/remember` to build your memory store."
             )
-        lines = [f"**What I know about {display_name}** ({len(all_rows)} memories)"]
+        lines = [f"**What I know about {name}** ({len(all_rows)} memories)"]
         for i, r in enumerate(all_rows[:15], 1):
             src = r.get("source", "")
             tag = src.split(":")[-1] if ":" in src else ""
@@ -1015,1290 +802,24 @@ async def _(message: discord.Message) -> None:
             lines.append(f"**{i}.** {content}" + (f"\n   _[{tag}]_" if tag else ""))
         return "\n\n".join(lines)
 
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _whoami)
-    await reply_long(message, reply, f"Memories: {display_name}")
+    await _slash_reply(interaction, _whoami, thread_name=f"Memories: {name}")
 
 
-# ── Knowledge commands ────────────────────────────────────────────────────────
+# ── Skills & Tools ────────────────────────────────────────────────────────────
 
-@cmd.prefix("!explain ", "!explain <concept>", "explain at three levels: simple, intermediate, expert")
-async def _(message: discord.Message, concept: str) -> None:
-    if not concept:
-        await message.channel.send("Usage: `!explain <concept or topic>`")
-        return
-    user_id      = message.author.id
-    display_name = message.author.display_name
-    loop         = asyncio.get_event_loop()
-
-    def _explain() -> str:
-        return _run_ask(
-            f"Explain '{concept}' at three levels:\n\n"
-            "**Simple (ELI5):** 2-3 sentences anyone can understand.\n\n"
-            "**Intermediate:** 3-5 sentences with key concepts and how they connect.\n\n"
-            "**Expert:** 3-5 sentences with technical depth, edge cases, and nuance.\n\n"
-            "Use web_search if the concept is recent or you need to verify details. "
-            "Be concise and concrete at each level.",
-            user_id, display_name,
-        )
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _explain)
-    await reply_long(message, reply, f"Explain: {concept[:50]}")
-
-
-@cmd.prefix("!compare ", "!compare <X> vs <Y>", "structured comparison of two things")
-async def _(message: discord.Message, arg: str) -> None:
-    if not arg or " vs " not in arg.lower():
-        await message.channel.send("Usage: `!compare <X> vs <Y>` — e.g. `!compare PyTorch vs JAX`")
-        return
-    user_id      = message.author.id
-    display_name = message.author.display_name
-    loop         = asyncio.get_event_loop()
-
-    def _compare() -> str:
-        return _run_ask(
-            f"Compare {arg} in a structured way.\n\n"
-            "Use web_search to get current, accurate information.\n\n"
-            "Format:\n"
-            "**Overview:** one sentence each on what both are.\n"
-            "**Key differences:** 4-6 bullet points covering the most important distinctions.\n"
-            "**When to use X:** 2-3 specific scenarios.\n"
-            "**When to use Y:** 2-3 specific scenarios.\n"
-            "**Verdict:** Which is better and for whom (be direct).",
-            user_id, display_name,
-        )
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _compare)
-    await reply_long(message, reply, f"Compare: {arg[:60]}")
-
-
-@cmd.prefix("!debate ", "!debate <topic>", "structured pros and cons analysis")
-async def _(message: discord.Message, topic: str) -> None:
-    if not topic:
-        await message.channel.send("Usage: `!debate <topic or claim>`")
-        return
-    user_id      = message.author.id
-    display_name = message.author.display_name
-    loop         = asyncio.get_event_loop()
-
-    def _debate() -> str:
-        return _run_ask(
-            f"Analyse: '{topic}'\n\n"
-            "Use web_search to find real arguments and evidence.\n\n"
-            "Format:\n"
-            "**For (strongest arguments):** 3-4 bullet points with evidence/reasoning.\n"
-            "**Against (strongest counterarguments):** 3-4 bullet points with evidence/reasoning.\n"
-            "**Nuance:** 1-2 important caveats or context the debate often misses.\n"
-            "**Bottom line:** your honest synthesis in 2-3 sentences.",
-            user_id, display_name,
-        )
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _debate)
-    await reply_long(message, reply, f"Debate: {topic[:50]}")
-
-
-@cmd.exact("!trending", "what's trending in AI/tech right now")
-async def _(message: discord.Message) -> None:
-    loop = asyncio.get_event_loop()
-
-    def _trending() -> str:
-        return _run_ask(
-            "What's trending in AI and tech right now? Use web_search with multiple queries:\n"
-            "1. 'AI news today' or 'AI announcements this week'\n"
-            "2. 'trending AI tools' or 'viral AI demos'\n"
-            "3. Check Hacker News and/or arXiv for hottest recent posts.\n\n"
-            "Format as:\n"
-            "**Top stories this week** — 3-4 items with a link and 1-sentence description each.\n"
-            "**Hot tools/models** — 2-3 notable releases or demos.\n"
-            "**Worth watching** — 1-2 early-stage things gaining traction."
-        )
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _trending)
-    await reply_long(message, reply, "Trending in AI/Tech")
-
-
-@cmd.prefix("!deep-dive ", "!deep-dive <topic>", "deep multi-source research synthesis (slow, thorough)")
-async def _(message: discord.Message, topic: str) -> None:
-    if not topic:
-        await message.channel.send("Usage: `!deep-dive <topic>` — thorough multi-source research, saved to memory.")
-        return
-    user_id      = message.author.id
-    display_name = message.author.display_name
-    await message.channel.send(
-        f"Starting deep research on **{topic}**…\n"
-        "This runs up to 15 agent turns with web search + arXiv. Results saved to your memory."
-    )
-    loop = asyncio.get_event_loop()
-
-    def _deep() -> str:
-        return _run_ask(
-            f"Perform a comprehensive deep research on: '{topic}'\n\n"
-            "Strategy (use ALL of these):\n"
-            "1. web_search with 3+ different query angles\n"
-            "2. arxiv_search for academic/technical papers\n"
-            "3. url_fetch to read 2-3 key sources in depth\n"
-            "4. think to synthesise findings at each stage\n"
-            "5. memory_store key findings tagged with 'user:{user_id}:deepdive:{topic[:25]}'\n\n"
-            "Output a structured report:\n"
-            "- **Executive Summary** (3-4 sentences)\n"
-            "- **Key Findings** (5-8 bullet points with sources)\n"
-            "- **Technical Details** (if applicable)\n"
-            "- **Current State / Recent Developments**\n"
-            "- **Open Questions / Controversies**\n"
-            "- **Key Sources** (list URLs used)",
-            user_id, display_name,
-        )
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _deep)
-    await reply_long(message, reply, f"Deep dive: {topic[:50]}")
-
-
-@cmd.exact("!models", "list Ollama models available locally")
-async def _(message: discord.Message) -> None:
-    loop = asyncio.get_event_loop()
-
-    def _models() -> str:
-        ollama_host = os.environ.get("OLLAMA_HOST", "http://host.docker.internal:11434")
-        try:
-            resp = httpx.get(f"{ollama_host}/api/tags", timeout=10)
-            resp.raise_for_status()
-            data   = resp.json()
-            models = data.get("models", [])
-            if not models:
-                return f"No Ollama models found at `{ollama_host}`."
-            lines = [f"**Ollama models** ({len(models)} available at `{ollama_host}`)", "```"]
-            for m in sorted(models, key=lambda x: x.get("name", "")):
-                name  = m.get("name", "?")
-                size  = m.get("size", 0)
-                size_str = f"{size / 1e9:.1f}GB" if size > 1e8 else ""
-                modified = (m.get("modified_at") or "")[:10]
-                lines.append(f"  {name:<35} {size_str:<8} {modified}")
-            lines.append("```")
-            lines.append(f"Active model: `{os.environ.get('JARVIS_MODEL', 'qwen3:8b')}` (configured in `config.persistent.toml`)")
-            return "\n".join(lines)
-        except Exception as exc:
-            return f"⚠️ Could not reach Ollama at `{ollama_host}`: {exc}"
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _models)
-    await send_chunked(message.channel, reply)
-
-
-# ── Events ────────────────────────────────────────────────────────────────────
-
-@client.event
-async def on_ready() -> None:
-    log.info(
-        "Jarvis bot online: %s (id=%s) | #%s | prefix=%s | tools=%d",
-        client.user, getattr(client.user, "id", "?"),
-        CHANNEL_NAME, COMMAND_PREFIX, len(AGENT_TOOLS),
-    )
-    # Sync slash commands.
-    # Guild sync first, then wipe stale globals (clears old global registrations that
-    # can cause CommandSignatureMismatch when they conflict with guild commands).
-    if DISCORD_GUILD_ID:
-        guild_obj = discord.Object(id=DISCORD_GUILD_ID)
-        # 1. Push current tree to guild
-        try:
-            tree.copy_global_to(guild=guild_obj)
-            synced = await tree.sync(guild=guild_obj)
-            log.info("Slash commands synced to guild %d (%d commands)", DISCORD_GUILD_ID, len(synced))
-        except discord.Forbidden:
-            log.warning(
-                "Slash command guild sync failed (403 Missing Access). "
-                "Re-invite the bot with the applications.commands scope: "
-                "https://discord.com/api/oauth2/authorize"
-                "?client_id=%s&permissions=2147830336&scope=bot+applications.commands",
-                getattr(client.application, "id", client.user.id if client.user else "?"),
-            )
-        except Exception as exc:
-            log.warning("Slash command guild sync failed: %s", exc)
-        # 2. Wipe stale global commands from Discord (non-fatal)
-        try:
-            tree.clear_commands(guild=None)
-            await tree.sync()
-            log.info("Stale global commands cleared")
-        except Exception as exc:
-            log.warning("Global command clear failed (non-fatal): %s", exc)
-    else:
-        try:
-            synced = await tree.sync()
-            log.info("Slash commands synced globally (%d commands)", len(synced))
-        except Exception as exc:
-            log.warning("Slash command global sync failed: %s", exc)
-    # Start scheduler in background thread after bot is ready
-    threading.Thread(target=_init_scheduler, daemon=True).start()
-
-
-@client.event
-async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
-    """👍 approves a proposal issue, 👎 closes it."""
-    if client.user and payload.user_id == client.user.id:
-        return
-    emoji = str(payload.emoji)
-    if emoji not in ("👍", "👎"):
-        return
-
-    try:
-        channel = client.get_channel(payload.channel_id) or \
-                  await client.fetch_channel(payload.channel_id)
-        message = await channel.fetch_message(payload.message_id)
-    except Exception:
-        return
-
-    if not client.user or message.author.id != client.user.id:
-        return
-
-    issue_number = _extract_issue_number(message.content)
-    if issue_number is None:
-        return
-
-    loop = asyncio.get_event_loop()
-    if emoji == "👍":
-        await loop.run_in_executor(_executor, _add_work_label, issue_number)
-        await channel.send(
-            f"✅ Issue #{issue_number} approved and added to Claude's work queue."
-        )
-    else:
-        await loop.run_in_executor(_executor, _close_issue, issue_number)
-        await channel.send(f"❌ Issue #{issue_number} withdrawn and closed.")
-
-
-@client.event
-async def on_message(message: discord.Message) -> None:
-    if message.author == client.user or message.author.bot:
-        return
-
-    content = message.content.strip()
-    lower   = content.lower()
-
-    # Try registered commands first
-    if await cmd.dispatch(message, content, lower):
-        return
-
-    # Regular Jarvis query
-    query = extract_query(message)
-    if query is None:
-        return
-
-    user_id      = message.author.id
-    display_name = message.author.display_name
-    loop         = asyncio.get_event_loop()
-
-    log.info("[%s] %s (id=%d): %s", message.channel, display_name, user_id, query[:100])
-
-    # Thread context
-    thread_ctx = ""
-    if isinstance(message.channel, discord.Thread):
-        thread_ctx = await build_thread_context(message.channel, message.id)
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(
-            _executor, _run_ask, query, user_id, display_name, thread_ctx
-        )
-
-    # Long non-thread replies → create a thread
-    if isinstance(message.channel, discord.TextChannel) and len(reply) > MAX_MSG_LEN:
-        try:
-            thread = await message.create_thread(
-                name=f"Jarvis: {query[:50]}", auto_archive_duration=60
-            )
-            await send_chunked(thread, reply)
-            return
-        except discord.Forbidden:
-            pass
-
-    await send_chunked(message.channel, reply)
-
-
-# ── GitHub workflow commands ──────────────────────────────────────────────────
-
-def _gh_api(path: str, method: str = "GET", json: dict | None = None) -> dict | list | None:
-    """Minimal GitHub REST helper — returns parsed JSON or None on error."""
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        return None
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/{path}"
-    try:
-        resp = httpx.request(method, url, headers=headers, json=json, timeout=15)
-        if resp.status_code in (200, 201):
-            return resp.json()
-        return {"_error": resp.status_code, "_text": resp.text[:300]}
-    except Exception as exc:
-        return {"_error": str(exc)}
-
-
-@cmd.prefix("!merge ", "!merge <pr#>", "merge a PR (squash + delete branch)")
-async def _(message: discord.Message, arg: str) -> None:
-    if not arg.isdigit():
-        await message.channel.send("Usage: `!merge <pr_number>` — e.g. `!merge 42`")
-        return
-    pr_number = int(arg)
-    loop      = asyncio.get_event_loop()
-
-    def _do_merge() -> str:
-        # Get PR details
-        pr = _gh_api(f"pulls/{pr_number}")
-        if not pr or "_error" in pr:
-            return f"⚠️ Could not fetch PR #{pr_number}: {pr}"
-        state = pr.get("state", "")
-        if state != "open":
-            return f"PR #{pr_number} is `{state}` — nothing to merge."
-        mergeable = pr.get("mergeable")
-        if mergeable is False:
-            return (
-                f"⚠️ PR #{pr_number} has merge conflicts.\n"
-                "Run `!ask-gemini <conflict details>` to get a resolution plan."
-            )
-        title    = pr.get("title", "")
-        head_ref = pr.get("head", {}).get("ref", "")
-        pr_url   = pr.get("html_url", "")
-
-        merge_data = _gh_api(
-            f"pulls/{pr_number}/merge",
-            method="PUT",
-            json={"merge_method": "squash", "commit_title": f"[JarvisPanda] {title} (#{pr_number})"},
-        )
-        if merge_data and "_error" not in merge_data:
-            sha = (merge_data.get("sha") or "")[:8]
-            # Delete branch
-            if head_ref:
-                _gh_api(f"git/refs/heads/{head_ref}", method="DELETE")
-            return f"✅ PR #{pr_number} merged (squash) → `{sha}`\n{pr_url}\nBranch `{head_ref}` deleted."
-        return f"⚠️ Merge failed: {merge_data}"
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _do_merge)
-    await send_chunked(message.channel, reply)
-
-
-@cmd.exact("!prs", "list open pull requests")
-async def _(message: discord.Message) -> None:
-    loop = asyncio.get_event_loop()
-
-    def _prs() -> str:
-        data = _gh_api("pulls?state=open&per_page=15")
-        if not data or "_error" in data:
-            return f"⚠️ Could not fetch PRs: {data}"
-        if not data:
-            return "No open pull requests."
-        lines = ["**Open Pull Requests**"]
-        for pr in data:
-            n     = pr["number"]
-            title = pr["title"][:60]
-            url   = pr["html_url"]
-            user  = pr.get("user", {}).get("login", "?")
-            lines.append(f"• **[#{n}]({url})** {title} — `{user}`  →  `!merge {n}`")
-        return "\n".join(lines)
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _prs)
-    await send_chunked(message.channel, reply)
-
-
-@cmd.exact("!queue", "show claude-code-work issue queue")
-async def _(message: discord.Message) -> None:
-    loop = asyncio.get_event_loop()
-
-    def _queue() -> str:
-        if not GITHUB_TOKEN or not GITHUB_REPO:
-            return "⚠️ GITHUB_TOKEN / GITHUB_REPO not configured."
-        lines = ["**Issue Worker Queue**"]
-        for label, emoji in [
-            ("claude-code-work",        "📥 queued"),
-            ("claude-code-in-progress", "⚙️ in progress"),
-            ("claude-code-done",        "✅ done (unmerged)"),
-            ("claude-code-failed",      "❌ failed"),
-        ]:
-            data = _gh_api(f"issues?labels={label}&state=open&per_page=10")
-            if not data or "_error" in data:
-                lines.append(f"{emoji}: (error fetching)")
-                continue
-            if not data:
-                lines.append(f"{emoji}: none")
-            else:
-                for issue in data[:5]:
-                    n     = issue["number"]
-                    title = issue["title"][:55]
-                    url   = issue["html_url"]
-                    lines.append(f"{emoji}: **[#{n}]({url})** {title}")
-        return "\n".join(lines)
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _queue)
-    await send_chunked(message.channel, reply)
-
-
-@cmd.prefix("!pr ", "!pr <number>", "show PR details and what changed")
-async def _(message: discord.Message, arg: str) -> None:
-    if not arg.isdigit():
-        await message.channel.send("Usage: `!pr <pr_number>`")
-        return
-    pr_number = int(arg)
-    loop      = asyncio.get_event_loop()
-
-    def _pr_detail() -> str:
-        pr = _gh_api(f"pulls/{pr_number}")
-        if not pr or "_error" in pr:
-            return f"⚠️ Could not fetch PR #{pr_number}"
-        title  = pr.get("title", "")
-        state  = pr.get("state", "")
-        url    = pr.get("html_url", "")
-        body   = (pr.get("body") or "")[:600]
-        branch = pr.get("head", {}).get("ref", "")
-        user   = pr.get("user", {}).get("login", "?")
-        files  = _gh_api(f"pulls/{pr_number}/files?per_page=20")
-        file_lines = []
-        if files and "_error" not in files:
-            for f in files[:15]:
-                fname = f.get("filename", "")
-                status = f.get("status", "")
-                adds  = f.get("additions", 0)
-                dels  = f.get("deletions", 0)
-                file_lines.append(f"  `{fname}` ({status} +{adds}/-{dels})")
-        files_str = "\n".join(file_lines) or "  _(no file data)_"
-        return (
-            f"**PR #{pr_number}** — `{state}`\n"
-            f"**{title}**\n{url}\n"
-            f"Author: `{user}` · Branch: `{branch}`\n\n"
-            f"**Files changed:**\n{files_str}\n\n"
-            f"**Description:**\n{body}\n\n"
-            f"Merge: `!merge {pr_number}`"
-        )
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _pr_detail)
-    await reply_long(message, reply, f"PR #{pr_number}")
-
-
-# ── Content & research commands ───────────────────────────────────────────────
-
-@cmd.exact("!brief", "morning brief: weather + AI news + insight")
-async def _(message: discord.Message) -> None:
-    user_id      = message.author.id
-    display_name = message.author.display_name
-    loop         = asyncio.get_event_loop()
-
-    def _brief() -> str:
-        city = DEFAULT_CITY or "New York"
-        weather = _call_tool("weather", city=city) or ""
-        return _run_ask(
-            f"Give me a concise morning brief with three sections:\n"
-            f"1. **Weather** — summarise this in 1-2 sentences: {weather[:300]}\n"
-            f"2. **Top AI Story** — use web_search to find the most-discussed AI news today, "
-            f"summarise in 3 sentences.\n"
-            f"3. **Insight** — one thought-provoking question or insight relevant to AI/tech "
-            f"I should think about today.\n\n"
-            f"Keep it concise and useful.",
-            user_id, display_name,
-        )
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _brief)
-    await reply_long(message, reply, "Morning Brief")
-
-
-@cmd.prefix("!papers", "!papers [topic]", "latest arXiv AI/ML papers (or custom topic)")
-async def _(message: discord.Message, topic: str) -> None:
-    query = topic or "LLM AI agent reasoning alignment"
-    loop  = asyncio.get_event_loop()
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(
-            _executor,
-            lambda: _call_tool("arxiv_search", query=query, max_results=8, sort_by="submittedDate")
-                    or _run_ask(f"Find the latest arXiv papers on: {query}"),
-        )
-    await reply_long(message, reply, f"arXiv: {query[:50]}")
-
-
-@cmd.prefix("!ask-gemini ", "!ask-gemini <question>", "ask Gemini Flash directly")
-async def _(message: discord.Message, question: str) -> None:
-    if not question:
-        await message.channel.send("Usage: `!ask-gemini <question>`")
-        return
-    loop = asyncio.get_event_loop()
-
-    def _gemini() -> str:
-        api_key = os.environ.get("GEMINI_API_KEY", "")
-        if not api_key:
-            return "⚠️ GEMINI_API_KEY is not configured."
-        try:
-            from openjarvis.tools.gemini_escalate import gemini_generate
-            resp = gemini_generate(question)
-            return f"**Gemini Flash** says:\n\n{resp}"
-        except Exception as exc:
-            return f"⚠️ Gemini call failed: {exc}"
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _gemini)
-    await reply_long(message, reply, f"Gemini: {question[:50]}")
-
-
-# ── Agent workflow commands ───────────────────────────────────────────────────
-
-@cmd.prefix("!agent ", "!agent <task>", "run a one-shot local agent task")
-async def _(message: discord.Message, task: str) -> None:
-    if not task:
-        await message.channel.send("Usage: `!agent <what you want the agent to do>`")
-        return
-    user_id      = message.author.id
-    display_name = message.author.display_name
-    loop         = asyncio.get_event_loop()
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(
-            _executor, _run_ask, task, user_id, display_name, ""
-        )
-    await reply_long(message, reply, f"Agent: {task[:50]}")
-
-
-@cmd.prefix("!build-tool ", "!build-tool <description>", "spec, plan, and propose a new Jarvis tool")
-async def _(message: discord.Message, description: str) -> None:
-    if not description:
-        await message.channel.send("Usage: `!build-tool <what the tool should do>`")
-        return
-    user_id      = message.author.id
-    display_name = message.author.display_name
-
-    await message.channel.send(
-        f"Designing tool: _{description}_\n"
-        "Consulting Gemini for a spec, then opening a GitHub issue…\n"
-        "React **👍** to queue for Claude Code, **👎** to withdraw."
-    )
-    loop = asyncio.get_event_loop()
-
-    def _build() -> str:
-        return _run_ask(
-            f"A user wants to build a new OpenJarvis tool:\n\n```\n{description}\n```\n\n"
-            "Steps:\n"
-            "1. Use gemini_escalate(mode=plan) to design a complete tool spec including:\n"
-            "   - Tool name (snake_case)\n"
-            "   - What it does and why it's useful\n"
-            "   - Parameters schema (JSON Schema)\n"
-            "   - Implementation approach (API used, dependencies)\n"
-            "   - Example usage\n"
-            "   - How it fits into the escalation chain\n"
-            "2. Use github_issue to create an issue with:\n"
-            "   - Title: 'feat: add {tool_name} tool'\n"
-            "   - Body: Gemini's full spec + implementation plan\n"
-            "   - The tool should follow BaseTool / ToolSpec patterns from existing tools\n"
-            "3. Return the issue URL so the user can approve or withdraw it.\n\n"
-            "Reference implementation: src/openjarvis/tools/weather.py is a clean example.",
-            user_id, display_name,
-        )
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _build)
-    await send_chunked(message.channel, reply)
-
-
-@cmd.prefix("!run-skill ", "!run-skill <name> [args]", "execute a registered Jarvis skill")
-async def _(message: discord.Message, arg: str) -> None:
-    if not arg:
-        await message.channel.send(
-            "Usage: `!run-skill <skill-name> [key=value ...]`\n"
-            "Run `!skills` to see available skills."
-        )
-        return
-    # Parse: first word is skill name, rest are args
-    parts      = arg.split(None, 1)
-    skill_name = parts[0]
-    skill_args = parts[1] if len(parts) > 1 else ""
-    user_id      = message.author.id
-    display_name = message.author.display_name
-    loop         = asyncio.get_event_loop()
-
-    def _skill() -> str:
-        return _run_ask(
-            f"Run the Jarvis skill named '{skill_name}'"
-            + (f" with these parameters: {skill_args}" if skill_args else "")
-            + ".\n\nIf the skill requires parameters not provided, use sensible defaults "
-            "or ask the user what they want. Report the result clearly.",
-            user_id, display_name,
-        )
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _skill)
-    await reply_long(message, reply, f"Skill: {skill_name}")
-
-
-@cmd.exact("!health", "on-demand system health check (same as observer)")
-async def _(message: discord.Message) -> None:
-    loop = asyncio.get_event_loop()
-
-    def _health() -> str:
-        lines = ["**On-demand Health Check**"]
-        # System
-        sys_info = _call_tool("system_monitor", detail="summary")
-        if sys_info:
-            lines.append(sys_info)
-        # GitHub queue summary
-        if GITHUB_TOKEN and GITHUB_REPO:
-            for label, emoji in [
-                ("claude-code-work", "📥 queued"),
-                ("claude-code-in-progress", "⚙️ in progress"),
-                ("claude-code-done", "✅ done (unmerged)"),
-            ]:
-                data = _gh_api(f"issues?labels={label}&state=open&per_page=5")
-                count = len(data) if isinstance(data, list) else 0
-                lines.append(f"{emoji}: {count}")
-            prs = _gh_api("pulls?state=open&per_page=5")
-            pr_count = len(prs) if isinstance(prs, list) else 0
-            lines.append(f"🔀 open PRs: {pr_count}")
-        return "\n".join(lines)
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _health)
-    await send_chunked(message.channel, reply)
-
-
-# ── Scheduler commands ────────────────────────────────────────────────────────
-
-@cmd.exact("!tasks", "list all scheduled background tasks")
-async def _(message: discord.Message) -> None:
-    loop = asyncio.get_event_loop()
-
-    def _list_tasks() -> str:
-        if _scheduler is None:
-            return "Scheduler is not running." + ("" if _SCHEDULER_AVAILABLE else " (openjarvis.scheduler unavailable)")
-        tasks = _scheduler.list_tasks()
-        if not tasks:
-            return "No scheduled tasks. Use `!schedule` to create one."
-        lines = ["**Scheduled Tasks**", "```"]
-        for t in tasks:
-            sched = f"{t.schedule_type}:{t.schedule_value}"
-            next_r = (t.next_run or "")[:16].replace("T", " ")
-            status_icon = {"active": "▶", "paused": "⏸", "cancelled": "✗", "completed": "✓"}.get(t.status, "?")
-            lines.append(f"  {status_icon} [{t.id[:8]}] {sched:<28} next:{next_r}")
-            lines.append(f"     {t.prompt[:70]}")
-        lines.append("```")
-        lines.append("Use `!cancel-task <id>` to cancel · `!task-log <id>` for run history")
-        return "\n".join(lines)
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _list_tasks)
-    await send_chunked(message.channel, reply)
-
-
-@cmd.prefix("!schedule ", "!schedule cron|interval <value> <prompt>", "create a recurring background task")
-async def _(message: discord.Message, arg: str) -> None:
-    """
-    Usage:
-      !schedule cron 0 9 * * * Daily morning weather check
-      !schedule interval 3600 Check HN for AI news and summarise
-    """
-    if not arg:
-        await message.channel.send(
-            "Usage: `!schedule <cron|interval> <value> <prompt>`\n"
-            "Examples:\n"
-            "  `!schedule cron 0 9 * * * Check weather and store in memory`\n"
-            "  `!schedule interval 7200 Search arXiv for new LLM papers and store results`"
-        )
-        return
-    if _scheduler is None:
-        await message.channel.send("Scheduler is not running." + ("" if _SCHEDULER_AVAILABLE else " (install openjarvis[server] for scheduler support)"))
-        return
-
-    parts = arg.split(None, 1)
-    if len(parts) < 2:
-        await message.channel.send("Usage: `!schedule <cron|interval> <value> <prompt>`")
-        return
-
-    sched_type = parts[0].lower()
-    rest = parts[1]
-
-    if sched_type not in ("cron", "interval"):
-        await message.channel.send("Schedule type must be `cron` or `interval`.")
-        return
-
-    if sched_type == "cron":
-        # cron expressions have 5 parts: split the first 5 words as the expression
-        cron_parts = rest.split(None, 5)
-        if len(cron_parts) < 6:
-            await message.channel.send("Cron format: `!schedule cron <min> <hr> <dom> <mon> <dow> <prompt>`\nExample: `!schedule cron 0 9 * * * Do morning research`")
-            return
-        schedule_value = " ".join(cron_parts[:5])
-        prompt = cron_parts[5]
-    else:
-        # interval: first word is seconds, rest is prompt
-        iv_parts = rest.split(None, 1)
-        if len(iv_parts) < 2:
-            await message.channel.send("Interval format: `!schedule interval <seconds> <prompt>`\nExample: `!schedule interval 3600 Search for AI news`")
-            return
-        schedule_value = iv_parts[0]
-        prompt = iv_parts[1]
-
-    loop = asyncio.get_event_loop()
-
-    def _create() -> str:
-        try:
-            t = _scheduler.create_task(  # type: ignore[union-attr]
-                prompt=prompt,
-                schedule_type=sched_type,
-                schedule_value=schedule_value,
-                agent="orchestrator",
-                tools=",".join(_BASELINE_TOOLS),
-                metadata={"created_by": str(message.author.id)},
-            )
-            next_r = (t.next_run or "")[:16].replace("T", " ")
-            return (
-                f"Task created: `{t.id[:8]}`\n"
-                f"Schedule: `{sched_type}:{schedule_value}`\n"
-                f"Next run: `{next_r} UTC`\n"
-                f"Prompt: {prompt[:100]}\n"
-                f"Cancel with: `!cancel-task {t.id[:8]}`"
-            )
-        except Exception as exc:
-            return f"⚠️ Failed to create task: {exc}"
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _create)
-    await send_chunked(message.channel, reply)
-
-
-def _resolve_task(task_id: str) -> "tuple[Any | None, str]":
-    """Find a task by ID prefix. Returns (task, error_msg)."""
-    if _scheduler is None:
-        return None, "Scheduler is not running."
-    all_tasks = _scheduler.list_tasks()
-    matches = [t for t in all_tasks if t.id.startswith(task_id)]
-    if not matches:
-        return None, f"No task found with id starting with `{task_id}`. Run `!tasks` to list."
-    if len(matches) > 1:
-        ids = ", ".join(t.id[:8] for t in matches)
-        return None, f"Multiple tasks match `{task_id}`: {ids}. Provide more characters."
-    return matches[0], ""
-
-
-@cmd.prefix("!pause-task ", "!pause-task <id>", "pause a scheduled task (resume with !resume-task)")
-async def _(message: discord.Message, task_id: str) -> None:
-    if not task_id:
-        await message.channel.send("Usage: `!pause-task <task-id>`")
-        return
-    loop = asyncio.get_event_loop()
-
-    def _pause() -> str:
-        t, err = _resolve_task(task_id)
-        if err:
-            return err
-        try:
-            _scheduler.pause_task(t.id)  # type: ignore[union-attr]
-            return f"Task `{t.id[:8]}` paused. Resume with `!resume-task {t.id[:8]}`\nWas: {t.prompt[:80]}"
-        except Exception as exc:
-            return f"⚠️ Pause failed: {exc}"
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _pause)
-    await send_chunked(message.channel, reply)
-
-
-@cmd.prefix("!resume-task ", "!resume-task <id>", "resume a paused scheduled task")
-async def _(message: discord.Message, task_id: str) -> None:
-    if not task_id:
-        await message.channel.send("Usage: `!resume-task <task-id>`")
-        return
-    loop = asyncio.get_event_loop()
-
-    def _resume() -> str:
-        t, err = _resolve_task(task_id)
-        if err:
-            return err
-        try:
-            _scheduler.resume_task(t.id)  # type: ignore[union-attr]
-            # Fetch updated task to get new next_run
-            updated = [x for x in _scheduler.list_tasks() if x.id == t.id]  # type: ignore[union-attr]
-            next_r = (updated[0].next_run if updated else "?")[:16].replace("T", " ")
-            return f"Task `{t.id[:8]}` resumed. Next run: `{next_r} UTC`\n{t.prompt[:80]}"
-        except Exception as exc:
-            return f"⚠️ Resume failed: {exc}"
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _resume)
-    await send_chunked(message.channel, reply)
-
-
-@cmd.prefix("!cancel-task ", "!cancel-task <id>", "permanently cancel a scheduled task")
-async def _(message: discord.Message, task_id: str) -> None:
-    if not task_id:
-        await message.channel.send("Usage: `!cancel-task <task-id>` — get IDs from `!tasks`")
-        return
-    if _scheduler is None:
-        await message.channel.send("Scheduler is not running.")
-        return
-
-    loop = asyncio.get_event_loop()
-
-    def _cancel() -> str:
-        t, err = _resolve_task(task_id)
-        if err:
-            return err
-        try:
-            _scheduler.cancel_task(t.id)  # type: ignore[union-attr]
-            return f"Task `{t.id[:8]}` cancelled (permanent).\nWas: {t.prompt[:80]}"
-        except Exception as exc:
-            return f"⚠️ Cancel failed: {exc}"
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _cancel)
-    await send_chunked(message.channel, reply)
-
-
-@cmd.prefix("!task-log ", "!task-log <id>", "show recent run history for a scheduled task")
-async def _(message: discord.Message, task_id: str) -> None:
-    if not task_id:
-        await message.channel.send("Usage: `!task-log <task-id>` — get IDs from `!tasks`")
-        return
-    if _scheduler is None:
-        await message.channel.send("Scheduler is not running.")
-        return
-
-    loop = asyncio.get_event_loop()
-
-    def _logs() -> str:
-        t, err = _resolve_task(task_id)
-        if err:
-            return err
-        try:
-            logs = _scheduler._store.get_run_logs(t.id, limit=5)  # type: ignore[union-attr]
-            if not logs:
-                return f"No run history for task `{t.id[:8]}`."
-            lines = [f"**Run log for `{t.id[:8]}`** ({len(logs)} most recent runs)", "```"]
-            for run in logs:
-                ok   = "✓" if run.get("success") else "✗"
-                ts   = (run.get("started_at") or "")[:16].replace("T", " ")
-                dur  = ""
-                if run.get("started_at") and run.get("finished_at"):
-                    try:
-                        from datetime import datetime, timezone
-                        s = datetime.fromisoformat(run["started_at"])
-                        f = datetime.fromisoformat(run["finished_at"])
-                        dur = f" ({int((f - s).total_seconds())}s)"
-                    except Exception:
-                        pass
-                lines.append(f"  {ok} {ts} UTC{dur}")
-                body = (run.get("result") or run.get("error") or "")[:120]
-                if body:
-                    lines.append(f"     {body}")
-            lines.append("```")
-            return "\n".join(lines)
-        except Exception as exc:
-            return f"⚠️ Log fetch failed: {exc}"
-
-    async with message.channel.typing():
-        reply = await loop.run_in_executor(_executor, _logs)
-    await send_chunked(message.channel, reply)
-
-
-# ── Slash commands ────────────────────────────────────────────────────────────
-# All major !commands are mirrored here so they appear in Discord's / menu
-# with autocomplete, type hints, and inline descriptions.
-# The underlying logic is identical — both layers call the same helpers.
-
-_Choice = discord.app_commands.Choice
-
-
-@tree.command(name="ask", description="Ask Jarvis anything")
-@discord.app_commands.describe(query="Your question or task")
-async def slash_ask(interaction: discord.Interaction, query: str) -> None:
-    uid  = interaction.user.id
-    name = interaction.user.display_name
-    await _slash_reply(
-        interaction,
-        lambda: _run_ask(query, uid, name),
-        thread_name=f"Jarvis: {query[:50]}",
-    )
-
-
-@tree.command(name="brief", description="Morning brief: weather + top AI story + daily insight")
-async def slash_brief(interaction: discord.Interaction) -> None:
-    uid  = interaction.user.id
-    name = interaction.user.display_name
-
-    def _brief() -> str:
-        city    = DEFAULT_CITY or "New York"
-        weather = _call_tool("weather", city=city) or ""
-        return _run_ask(
-            f"Give me a concise morning brief:\n"
-            f"1. **Weather** — summarise: {weather[:300]}\n"
-            f"2. **Top AI Story** — use web_search, 3 sentences.\n"
-            f"3. **Insight** — one thought-provoking question for today.\n"
-            f"Keep it concise and useful.",
-            uid, name,
-        )
-
-    await _slash_reply(interaction, _brief, thread_name="Morning Brief")
-
-
-@tree.command(name="weather", description="Current weather + 3-day forecast")
-@discord.app_commands.describe(city="City name (leave blank for default)")
-async def slash_weather(interaction: discord.Interaction, city: str = "") -> None:
-    city = city or DEFAULT_CITY
-    if not city:
-        await interaction.response.send_message(
-            "Usage: `/weather city:London` — or set `DEFAULT_WEATHER_CITY` in `.env`",
-            ephemeral=True,
-        )
-        return
-    await _slash_reply(
-        interaction,
-        lambda: _call_tool("weather", city=city) or _run_ask(f"Weather in {city}?"),
-    )
-
-
-@tree.command(name="research", description="Multi-source research synthesis stored to your memory")
-@discord.app_commands.describe(topic="What to research")
-async def slash_research(interaction: discord.Interaction, topic: str) -> None:
-    uid  = interaction.user.id
-    name = interaction.user.display_name
-
-    def _research() -> str:
-        return _run_ask(
-            f"Research '{topic}' thoroughly.\n"
-            "1. Use web_search (at least 2 angles).\n"
-            "2. Use arxiv_search if technical/scientific.\n"
-            "3. Check retrieval for prior memory context.\n"
-            "4. Synthesise: Overview, Key Concepts, Recent Developments, "
-            "Practical Applications, Key Takeaways.\n"
-            f"5. Store findings tagged 'user:{uid}:research:{topic[:30]}'.",
-            uid, name,
-        )
-
-    await _slash_reply(interaction, _research, thread_name=f"Research: {topic[:50]}")
-
-
-@tree.command(name="arxiv", description="Search recent arXiv papers")
-@discord.app_commands.describe(query="Search query")
-async def slash_arxiv(interaction: discord.Interaction, query: str) -> None:
-    await _slash_reply(
-        interaction,
-        lambda: _call_tool("arxiv_search", query=query, max_results=8)
-                or _run_ask(f"Search arXiv for: {query}"),
-        thread_name=f"arXiv: {query[:50]}",
-    )
-
-
-@tree.command(name="papers", description="Latest AI/ML arXiv papers (or specify a topic)")
-@discord.app_commands.describe(topic="Topic to search (leave blank for general AI/ML)")
-async def slash_papers(interaction: discord.Interaction, topic: str = "") -> None:
-    query = topic or "LLM AI agent reasoning alignment"
-    await _slash_reply(
-        interaction,
-        lambda: _call_tool("arxiv_search", query=query, max_results=8, sort_by="submittedDate")
-                or _run_ask(f"Latest arXiv papers on: {query}"),
-        thread_name=f"arXiv: {query[:50]}",
-    )
-
-
-@tree.command(name="summarize", description="Fetch and summarise a web page")
-@discord.app_commands.describe(url="URL to summarise")
-async def slash_summarize(interaction: discord.Interaction, url: str) -> None:
-    def _summarize() -> str:
-        raw = _call_tool("url_fetch", url=url, max_chars=6000)
-        if raw:
-            return _run_ask(
-                f"Summarise this page. Key points and main argument.\n\nURL: {url}\n\n{raw}"
-            )
-        return _run_ask(f"Fetch and summarise: {url}")
-
-    await _slash_reply(interaction, _summarize, thread_name=f"Summary: {url[:60]}")
-
-
-@tree.command(name="memory", description="Search your personal memory store")
-@discord.app_commands.describe(query="Search terms")
-async def slash_memory(interaction: discord.Interaction, query: str) -> None:
-    uid = interaction.user.id
-
-    def _mem() -> str:
-        rows = _search_user_memory(query, uid)
-        if not rows:
-            return (
-                f"No memories found for '{query}'.\n"
-                "Chat with Jarvis and it will build your memory store over time."
-            )
-        lines = [f"**Memory results for '{query}'** ({len(rows)})"]
-        for i, r in enumerate(rows, 1):
-            lines.append(f"**{i}.** {r.get('content', '')[:280]}")
-        return "\n\n".join(lines)
-
-    await _slash_reply(interaction, _mem)
-
-
-@tree.command(name="digest", description="On-demand HN AI digest (top stories, last 72h)")
-async def slash_digest(interaction: discord.Interaction) -> None:
-    def _digest() -> str:
-        return _run_ask(
-            "Fetch the top 10 most-discussed AI/ML stories on Hacker News from "
-            "the last 72 hours. Use web_search. For each: rank, title (as a link), "
-            "comment count, score, one-sentence description. "
-            "Format as a numbered Discord-friendly list."
-        )
-
-    await _slash_reply(interaction, _digest, thread_name="HN AI Digest")
-
-
-@tree.command(name="ask-gemini", description="Ask Gemini Flash directly, bypassing the local model")
-@discord.app_commands.describe(question="Question for Gemini")
-async def slash_ask_gemini(interaction: discord.Interaction, question: str) -> None:
-    def _gemini() -> str:
-        api_key = os.environ.get("GEMINI_API_KEY", "")
-        if not api_key:
-            return "⚠️ GEMINI_API_KEY is not configured."
-        try:
-            from openjarvis.tools.gemini_escalate import gemini_generate
-            return f"**Gemini Flash** says:\n\n{gemini_generate(question)}"
-        except Exception as exc:
-            return f"⚠️ Gemini call failed: {exc}"
-
-    await _slash_reply(interaction, _gemini, thread_name=f"Gemini: {question[:50]}")
-
-
-@tree.command(name="status", description="Show engine, model, Gemini/GitHub config, and host stats")
-async def slash_status(interaction: discord.Interaction) -> None:
-    def _status() -> str:
-        try:
-            j   = _get_jarvis()
-            cfg = j._config  # type: ignore[attr-defined]
-            model  = getattr(cfg.intelligence, "default_model", "?")
-            engine = getattr(cfg.intelligence, "preferred_engine", "?")
-        except Exception:
-            model, engine = "?", "?"
-        sys_info  = _call_tool("system_monitor") or "system_monitor unavailable"
-        gemini_ok = bool(os.environ.get("GEMINI_API_KEY"))
-        github_ok = bool(GITHUB_TOKEN and GITHUB_REPO)
-        return (
-            f"**Jarvis Status**\n```\n"
-            f"Local model : {model} ({engine})\n"
-            f"Gemini      : {'✓ configured' if gemini_ok else '✗ not set'}\n"
-            f"GitHub      : {'✓ ' + GITHUB_REPO if github_ok else '✗ not set'}\n"
-            f"Tools loaded: {len(AGENT_TOOLS)}\n"
-            f"```\n{sys_info}"
-        )
-
-    await _slash_reply(interaction, _status)
-
-
-@tree.command(name="health", description="On-demand health check: system + GitHub queue")
-async def slash_health(interaction: discord.Interaction) -> None:
-    def _health() -> str:
-        lines = ["**On-demand Health Check**"]
-        sys_info = _call_tool("system_monitor", detail="summary")
-        if sys_info:
-            lines.append(sys_info)
-        if GITHUB_TOKEN and GITHUB_REPO:
-            for label, emoji in [
-                ("claude-code-work", "📥 queued"),
-                ("claude-code-in-progress", "⚙️ in progress"),
-                ("claude-code-done", "✅ done (unmerged)"),
-            ]:
-                data  = _gh_api(f"issues?labels={label}&state=open&per_page=5")
-                count = len(data) if isinstance(data, list) else 0
-                lines.append(f"{emoji}: {count}")
-            prs = _gh_api("pulls?state=open&per_page=5")
-            lines.append(f"🔀 open PRs: {len(prs) if isinstance(prs, list) else 0}")
-        return "\n".join(lines)
-
-    await _slash_reply(interaction, _health)
-
-
-@tree.command(name="queue", description="Show the Claude Code issue queue")
-async def slash_queue(interaction: discord.Interaction) -> None:
-    def _queue() -> str:
-        if not GITHUB_TOKEN or not GITHUB_REPO:
-            return "⚠️ GITHUB_TOKEN / GITHUB_REPO not configured."
-        lines = ["**Issue Worker Queue**"]
-        for label, emoji in [
-            ("claude-code-work",        "📥 queued"),
-            ("claude-code-in-progress", "⚙️ in progress"),
-            ("claude-code-done",        "✅ done (unmerged)"),
-            ("claude-code-failed",      "❌ failed"),
-        ]:
-            data = _gh_api(f"issues?labels={label}&state=open&per_page=10")
-            if not isinstance(data, list):
-                lines.append(f"{emoji}: (error)")
-                continue
-            for issue in (data or [])[:5]:
-                n, title, url = issue["number"], issue["title"][:55], issue["html_url"]
-                lines.append(f"{emoji}: **[#{n}]({url})** {title}")
-            if not data:
-                lines.append(f"{emoji}: none")
-        return "\n".join(lines)
-
-    await _slash_reply(interaction, _queue)
-
-
-@tree.command(name="prs", description="List open pull requests")
-async def slash_prs(interaction: discord.Interaction) -> None:
-    def _prs() -> str:
-        data = _gh_api("pulls?state=open&per_page=15")
-        if not isinstance(data, list):
-            return f"⚠️ Could not fetch PRs: {data}"
-        if not data:
-            return "No open pull requests."
-        lines = ["**Open Pull Requests**"]
-        for pr in data:
-            n, title = pr["number"], pr["title"][:60]
-            url, user = pr["html_url"], pr.get("user", {}).get("login", "?")
-            lines.append(f"• **[#{n}]({url})** {title} — `{user}` → `/merge {n}`")
-        return "\n".join(lines)
-
-    await _slash_reply(interaction, _prs)
-
-
-@tree.command(name="pr", description="Show PR details: files changed and description")
-@discord.app_commands.describe(number="Pull request number")
-async def slash_pr(interaction: discord.Interaction, number: int) -> None:
-    def _pr_detail() -> str:
-        pr = _gh_api(f"pulls/{number}")
-        if not pr or "_error" in pr:
-            return f"⚠️ Could not fetch PR #{number}"
-        title  = pr.get("title", "")
-        state  = pr.get("state", "")
-        url    = pr.get("html_url", "")
-        body   = (pr.get("body") or "")[:600]
-        branch = pr.get("head", {}).get("ref", "")
-        user   = pr.get("user", {}).get("login", "?")
-        files  = _gh_api(f"pulls/{number}/files?per_page=20")
-        file_lines = []
-        if isinstance(files, list):
-            for f in files[:15]:
-                fname  = f.get("filename", "")
-                status = f.get("status", "")
-                adds   = f.get("additions", 0)
-                dels   = f.get("deletions", 0)
-                file_lines.append(f"  `{fname}` ({status} +{adds}/-{dels})")
-        files_str = "\n".join(file_lines) or "  _(no file data)_"
-        return (
-            f"**PR #{number}** — `{state}`\n**{title}**\n{url}\n"
-            f"Author: `{user}` · Branch: `{branch}`\n\n"
-            f"**Files changed:**\n{files_str}\n\n"
-            f"**Description:**\n{body}\n\nMerge: `/merge {number}`"
-        )
-
-    await _slash_reply(interaction, _pr_detail, thread_name=f"PR #{number}")
-
-
-@tree.command(name="merge", description="Squash-merge a PR and delete the source branch")
-@discord.app_commands.describe(number="Pull request number")
-async def slash_merge(interaction: discord.Interaction, number: int) -> None:
-    def _do_merge() -> str:
-        pr = _gh_api(f"pulls/{number}")
-        if not pr or "_error" in pr:
-            return f"⚠️ Could not fetch PR #{number}: {pr}"
-        if pr.get("state") != "open":
-            return f"PR #{number} is `{pr.get('state')}` — nothing to merge."
-        if pr.get("mergeable") is False:
-            return (
-                f"⚠️ PR #{number} has merge conflicts.\n"
-                "Use `/ask-gemini` with the conflict details to get a resolution plan."
-            )
-        title    = pr.get("title", "")
-        head_ref = pr.get("head", {}).get("ref", "")
-        pr_url   = pr.get("html_url", "")
-        result   = _gh_api(
-            f"pulls/{number}/merge", method="PUT",
-            json={"merge_method": "squash",
-                  "commit_title": f"[JarvisPanda] {title} (#{number})"},
-        )
-        if result and "_error" not in result:
-            sha = (result.get("sha") or "")[:8]
-            if head_ref:
-                _gh_api(f"git/refs/heads/{head_ref}", method="DELETE")
-            return f"✅ PR #{number} merged → `{sha}`\n{pr_url}\nBranch `{head_ref}` deleted."
-        return f"⚠️ Merge failed: {result}"
-
-    await _slash_reply(interaction, _do_merge)
-
-
-@tree.command(name="propose", description="Draft a feature proposal and submit it to GitHub")
-@discord.app_commands.describe(idea="Describe the feature you want")
-async def slash_propose(interaction: discord.Interaction, idea: str) -> None:
-    uid  = interaction.user.id
-    name = interaction.user.display_name
-    await interaction.response.defer(thinking=True)
-    await interaction.followup.send(
-        "Analysing proposal, consulting Gemini, and opening a GitHub issue…\n"
-        "React **👍** to approve for Claude's queue, **👎** to withdraw."
-    )
-    loop  = asyncio.get_event_loop()
-    reply = await loop.run_in_executor(
-        _executor,
-        lambda: _run_ask(
-            f"Discord user {name} proposed:\n\n```\n{idea}\n```\n\n"
-            "1. Use gemini_escalate(mode=plan) for an implementation plan.\n"
-            "2. Use github_issue with the plan, a clear title (<80 chars), "
-            "and acceptance criteria.\n"
-            "3. Return the issue URL.",
-            uid, name,
-        ),
-    )
-    await interaction.followup.send(reply[:MAX_MSG_LEN])
-
-
-@tree.command(name="build-tool", description="Design, spec, and propose a new Jarvis tool via GitHub issue")
-@discord.app_commands.describe(description="What the tool should do")
-async def slash_build_tool(interaction: discord.Interaction, description: str) -> None:
-    uid  = interaction.user.id
-    name = interaction.user.display_name
-    await interaction.response.defer(thinking=True)
-    await interaction.followup.send(
-        f"Designing tool: _{description}_\n"
-        "Consulting Gemini for a spec, then opening a GitHub issue…\n"
-        "React **👍** to queue for Claude Code, **👎** to withdraw."
-    )
-    loop  = asyncio.get_event_loop()
-    reply = await loop.run_in_executor(
-        _executor,
-        lambda: _run_ask(
-            f"Build a new OpenJarvis tool:\n\n```\n{description}\n```\n\n"
-            "1. gemini_escalate(mode=plan) for a complete spec: name, params, "
-            "implementation, example usage.\n"
-            "2. github_issue with the spec (title: 'feat: add {tool_name} tool').\n"
-            "3. Return the issue URL.\n\n"
-            "Reference: src/openjarvis/tools/weather.py",
-            uid, name,
-        ),
-    )
-    await interaction.followup.send(reply[:MAX_MSG_LEN])
-
-
-@tree.command(name="agent", description="Run a one-shot local agent task")
-@discord.app_commands.describe(task="What you want the agent to do")
-async def slash_agent(interaction: discord.Interaction, task: str) -> None:
-    uid  = interaction.user.id
-    name = interaction.user.display_name
-    await _slash_reply(
-        interaction,
-        lambda: _run_ask(task, uid, name),
-        thread_name=f"Agent: {task[:50]}",
-    )
-
-
-@tree.command(name="run-skill", description="Execute a registered Jarvis skill")
+@tree.command(name="run-skill", description="Execute a registered Jarvis skill pipeline")
 @discord.app_commands.describe(
     skill_name="Skill name (see /skills for list)",
     args="Optional key=value arguments",
 )
-async def slash_run_skill(
-    interaction: discord.Interaction, skill_name: str, args: str = ""
-) -> None:
-    uid  = interaction.user.id
-    name = interaction.user.display_name
+async def slash_run_skill(interaction: discord.Interaction, skill_name: str, args: str = "") -> None:
+    uid, name = interaction.user.id, interaction.user.display_name
     await _slash_reply(
         interaction,
         lambda: _run_ask(
             f"Run the Jarvis skill '{skill_name}'"
             + (f" with parameters: {args}" if args else "")
-            + ". Use sensible defaults for missing parameters.",
+            + ". Use sensible defaults for missing parameters. Report the result clearly.",
             uid, name,
         ),
         thread_name=f"Skill: {skill_name}",
@@ -2325,8 +846,12 @@ async def slash_skills(interaction: discord.Interaction) -> None:
             "  morning-brief            Weather + AI story + daily insight\n"
             "  topic-research           Research + store to memory\n"
             "  web-summarize            Summarise a web page\n"
+            "  pdf-summarize            Extract and summarise a PDF\n"
             "  code-lint                Lint and review code\n"
+            "  code-test-gen            Generate unit tests from code\n"
             "  data-analyze             Analyse and interpret data\n"
+            "  translate-doc            Translate a document\n"
+            "  meeting-notes            Summarise meeting notes/transcripts\n"
             "```"
         )
 
@@ -2344,7 +869,116 @@ async def slash_tools(interaction: discord.Interaction) -> None:
     await interaction.response.send_message("\n".join(lines))
 
 
-# ── Slash: scheduler commands ─────────────────────────────────────────────────
+@tree.command(name="models", description="List Ollama models available locally")
+async def slash_models(interaction: discord.Interaction) -> None:
+    def _models() -> str:
+        try:
+            resp   = httpx.get(f"{OLLAMA_HOST}/api/tags", timeout=10)
+            resp.raise_for_status()
+            models = resp.json().get("models", [])
+            if not models:
+                return f"No Ollama models found at `{OLLAMA_HOST}`."
+            lines = [f"**Ollama models** ({len(models)} at `{OLLAMA_HOST}`)", "```"]
+            for m in sorted(models, key=lambda x: x.get("name", "")):
+                name_m   = m.get("name", "?")
+                size     = m.get("size", 0)
+                size_str = f"{size / 1e9:.1f}GB" if size > 1e8 else ""
+                modified = (m.get("modified_at") or "")[:10]
+                lines.append(f"  {name_m:<35} {size_str:<8} {modified}")
+            lines.append("```")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"⚠️ Could not reach Ollama at `{OLLAMA_HOST}`: {exc}"
+
+    await _slash_reply(interaction, _models)
+
+
+# ── System ────────────────────────────────────────────────────────────────────
+
+@tree.command(name="status", description="Show engine, model, Gemini/Tavily config, and host stats")
+async def slash_status(interaction: discord.Interaction) -> None:
+    def _status() -> str:
+        try:
+            j      = _get_jarvis()
+            cfg    = j._config  # type: ignore[attr-defined]
+            model  = getattr(cfg.intelligence, "default_model", "?")
+            engine = getattr(cfg.intelligence, "preferred_engine", "?")
+        except Exception:
+            model, engine = "?", "?"
+        sys_info   = _call_tool("system_monitor") or "system_monitor unavailable"
+        gemini_ok  = bool(os.environ.get("GEMINI_API_KEY"))
+        tavily_ok  = bool(os.environ.get("TAVILY_API_KEY"))
+        ollama_ok  = False
+        try:
+            r = httpx.get(f"{OLLAMA_HOST}/api/tags", timeout=3)
+            ollama_ok = r.status_code == 200
+        except Exception:
+            pass
+        return (
+            f"**Jarvis Status**\n```\n"
+            f"Local model : {model} ({engine})\n"
+            f"Ollama      : {'✓ reachable' if ollama_ok else '✗ unreachable'} ({OLLAMA_HOST})\n"
+            f"Gemini      : {'✓ configured' if gemini_ok else '✗ not set'}\n"
+            f"Tavily      : {'✓ configured' if tavily_ok else '✗ not set (using DuckDuckGo)'}\n"
+            f"Tools loaded: {len(AGENT_TOOLS)}\n"
+            f"```\n{sys_info}"
+        )
+
+    await _slash_reply(interaction, _status)
+
+
+@tree.command(name="health", description="System health: CPU/RAM/GPU + Ollama status")
+async def slash_health(interaction: discord.Interaction) -> None:
+    def _health() -> str:
+        lines    = ["**System Health**"]
+        sys_info = _call_tool("system_monitor", detail="full")
+        if sys_info:
+            lines.append(sys_info)
+        try:
+            resp   = httpx.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
+            models = resp.json().get("models", [])
+            lines.append(f"Ollama: ✓ {len(models)} model(s) at `{OLLAMA_HOST}`")
+        except Exception as exc:
+            lines.append(f"Ollama: ✗ unreachable — `{exc}`")
+        return "\n".join(lines)
+
+    await _slash_reply(interaction, _health)
+
+
+@tree.command(name="mcp", description="Show MCP server status")
+async def slash_mcp(interaction: discord.Interaction) -> None:
+    def _mcp() -> str:
+        try:
+            j       = _get_jarvis()
+            cfg     = j._config  # type: ignore[attr-defined]
+            mcp_cfg = getattr(getattr(cfg, "tools", None), "mcp", None)
+            if not mcp_cfg or not getattr(mcp_cfg, "enabled", False):
+                return "MCP is disabled. Enable with `[tools.mcp] enabled = true` in config."
+            servers = getattr(mcp_cfg, "servers", []) or []
+            if not servers:
+                return "MCP is enabled but no servers are configured."
+            lines = ["**MCP Servers**", "```"]
+            for s in servers:
+                name = getattr(s, "name", "?")
+                cmd  = " ".join(getattr(s, "command", []))
+                lines.append(f"  {name:<20} {cmd[:55]}")
+            lines.append("```")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"⚠️ MCP status error: {exc}"
+
+    await _slash_reply(interaction, _mcp)
+
+
+@tree.command(name="sysinfo", description="Detailed host CPU/RAM/GPU/disk stats")
+async def slash_sysinfo(interaction: discord.Interaction) -> None:
+    await _slash_reply(
+        interaction,
+        lambda: _call_tool("system_monitor", detail="full") or "system_monitor unavailable",
+    )
+
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
 
 @tree.command(name="tasks", description="List all scheduled background tasks")
 async def slash_tasks(interaction: discord.Interaction) -> None:
@@ -2377,12 +1011,7 @@ async def slash_tasks(interaction: discord.Interaction) -> None:
     _Choice(name="cron",     value="cron"),
     _Choice(name="interval", value="interval"),
 ])
-async def slash_schedule(
-    interaction: discord.Interaction,
-    type: str,
-    value: str,
-    prompt: str,
-) -> None:
+async def slash_schedule(interaction: discord.Interaction, type: str, value: str, prompt: str) -> None:
     if _scheduler is None:
         await interaction.response.send_message("Scheduler is not running.", ephemeral=True)
         return
@@ -2474,8 +1103,8 @@ async def slash_task_log(interaction: discord.Interaction, id: str) -> None:
                 return f"No run history for `{t.id[:8]}`."
             lines = [f"**Run log — `{t.id[:8]}`**", "```"]
             for run in logs:
-                ok  = "✓" if run.get("success") else "✗"
-                ts  = (run.get("started_at") or "")[:16].replace("T", " ")
+                ok   = "✓" if run.get("success") else "✗"
+                ts   = (run.get("started_at") or "")[:16].replace("T", " ")
                 body = (run.get("result") or run.get("error") or "")[:120]
                 lines.append(f"  {ok} {ts} UTC")
                 if body:
@@ -2488,294 +1117,64 @@ async def slash_task_log(interaction: discord.Interaction, id: str) -> None:
     await _slash_reply(interaction, _logs)
 
 
-@tree.command(name="remember", description="Store a fact or note to your personal long-term memory")
-@discord.app_commands.describe(fact="The fact, note, or information to remember")
-async def slash_remember(interaction: discord.Interaction, fact: str) -> None:
-    uid  = interaction.user.id
-    name = interaction.user.display_name
-
-    def _remember() -> str:
-        result = _call_tool(
-            "memory_store",
-            content=fact,
-            source=f"user:{uid}:manual",
-            metadata={"user_id": str(uid), "display_name": name},
-        )
-        if result is not None:
-            return f"✅ Remembered: _{fact[:200]}_"
-        return _run_ask(
-            f"Store this to long-term memory using memory_store. "
-            f"Source: 'user:{uid}:manual'.\n\nFact: {fact}",
-            uid, name,
-        )
-
-    await _slash_reply(interaction, _remember)
-
-
-@tree.command(name="forget", description="Delete memories matching a query")
-@discord.app_commands.describe(query="Search terms for the memories to delete")
-async def slash_forget(interaction: discord.Interaction, query: str) -> None:
-    uid = interaction.user.id
-
-    def _forget() -> str:
-        rows = _search_user_memory(query, uid)
-        if not rows:
-            return f"No memories found matching '{query}'."
-        db = Path(MEMORY_DB_PATH)
-        deleted = 0
-        try:
-            conn = sqlite3.connect(str(db), timeout=5)
-            uid_filter = f"%user:{uid}%"
-            cur = conn.cursor()
-            for row in rows:
-                content = row.get("content", "")
-                try:
-                    cur.execute(
-                        "DELETE FROM memories WHERE content = ? AND (source LIKE ? OR metadata LIKE ?)",
-                        (content, uid_filter, uid_filter),
-                    )
-                    deleted += cur.rowcount
-                except Exception:
-                    pass
-            conn.commit()
-            conn.close()
-        except Exception as exc:
-            return f"⚠️ Failed to delete memories: {exc}"
-        return f"🗑️ Deleted {deleted} memor{'y' if deleted == 1 else 'ies'} matching '{query}'."
-
-    await _slash_reply(interaction, _forget)
-
-
-@tree.command(name="whoami", description="Show everything Jarvis knows about you from memory")
-async def slash_whoami(interaction: discord.Interaction) -> None:
-    uid  = interaction.user.id
-    name = interaction.user.display_name
-
-    def _whoami() -> str:
-        db = Path(MEMORY_DB_PATH)
-        all_rows: list[dict] = []
-        try:
-            conn = sqlite3.connect(str(db), timeout=5)
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            uid_filter = f"%user:{uid}%"
-            cur.execute(
-                "SELECT content, source FROM memories "
-                "WHERE source LIKE ? OR metadata LIKE ? LIMIT 20",
-                (uid_filter, uid_filter),
-            )
-            all_rows = [dict(r) for r in cur.fetchall()]
-            conn.close()
-        except Exception:
-            pass
-        if not all_rows:
-            return (
-                f"I don't have any memories about you yet, {name}.\n"
-                "Chat with me, use `/remember`, or run `/research` on topics to build your memory."
-            )
-        lines = [f"**What I know about {name}** ({len(all_rows)} memories)"]
-        for i, r in enumerate(all_rows[:15], 1):
-            src = r.get("source", "")
-            tag = src.split(":")[-1] if ":" in src else ""
-            content = r.get("content", "")[:200]
-            lines.append(f"**{i}.** {content}" + (f"\n   _[{tag}]_" if tag else ""))
-        return "\n\n".join(lines)
-
-    await _slash_reply(interaction, _whoami, thread_name=f"Memories: {name}")
-
-
-@tree.command(name="explain", description="Explain a concept at simple, intermediate, and expert levels")
-@discord.app_commands.describe(concept="What to explain")
-async def slash_explain(interaction: discord.Interaction, concept: str) -> None:
-    uid  = interaction.user.id
-    name = interaction.user.display_name
-
-    def _explain() -> str:
-        return _run_ask(
-            f"Explain '{concept}' at three levels:\n\n"
-            "**Simple (ELI5):** 2-3 sentences anyone can understand.\n\n"
-            "**Intermediate:** 3-5 sentences with key concepts and how they connect.\n\n"
-            "**Expert:** 3-5 sentences with technical depth, edge cases, and nuance.\n\n"
-            "Use web_search if recent or technical. Be concise and concrete.",
-            uid, name,
-        )
-
-    await _slash_reply(interaction, _explain, thread_name=f"Explain: {concept[:50]}")
-
-
-@tree.command(name="compare", description="Structured comparison of two things")
-@discord.app_commands.describe(items="What to compare, e.g. 'PyTorch vs JAX'")
-async def slash_compare(interaction: discord.Interaction, items: str) -> None:
-    uid  = interaction.user.id
-    name = interaction.user.display_name
-
-    if " vs " not in items.lower():
-        await interaction.response.send_message(
-            "Format: `/compare items:X vs Y` — e.g. `/compare items:PyTorch vs JAX`",
-            ephemeral=True,
-        )
-        return
-
-    def _compare() -> str:
-        return _run_ask(
-            f"Compare {items}.\n\nUse web_search for current info.\n\n"
-            "**Overview:** one sentence each.\n"
-            "**Key differences:** 4-6 bullet points.\n"
-            "**When to use each:** 2-3 scenarios each.\n"
-            "**Verdict:** direct recommendation.",
-            uid, name,
-        )
-
-    await _slash_reply(interaction, _compare, thread_name=f"Compare: {items[:60]}")
-
-
-@tree.command(name="debate", description="Structured pros and cons analysis for any claim or topic")
-@discord.app_commands.describe(topic="Topic or claim to analyse")
-async def slash_debate(interaction: discord.Interaction, topic: str) -> None:
-    uid  = interaction.user.id
-    name = interaction.user.display_name
-
-    def _debate() -> str:
-        return _run_ask(
-            f"Analyse: '{topic}'\n\nUse web_search for real arguments.\n\n"
-            "**For:** 3-4 bullet points with evidence.\n"
-            "**Against:** 3-4 bullet points with evidence.\n"
-            "**Nuance:** 1-2 caveats the debate often misses.\n"
-            "**Bottom line:** honest synthesis in 2-3 sentences.",
-            uid, name,
-        )
-
-    await _slash_reply(interaction, _debate, thread_name=f"Debate: {topic[:50]}")
-
-
-@tree.command(name="trending", description="What's trending in AI and tech right now")
-async def slash_trending(interaction: discord.Interaction) -> None:
-    def _trending() -> str:
-        return _run_ask(
-            "What's trending in AI and tech right now? Use web_search with multiple queries.\n\n"
-            "**Top stories this week** — 3-4 items with link + 1-sentence description.\n"
-            "**Hot tools/models** — 2-3 notable releases or demos.\n"
-            "**Worth watching** — 1-2 early-stage things gaining traction."
-        )
-
-    await _slash_reply(interaction, _trending, thread_name="Trending in AI/Tech")
-
-
-@tree.command(name="deep-dive", description="Thorough multi-source research with arXiv + web, saved to memory")
-@discord.app_commands.describe(topic="Topic for deep research")
-async def slash_deep_dive(interaction: discord.Interaction, topic: str) -> None:
-    uid  = interaction.user.id
-    name = interaction.user.display_name
-    await interaction.response.defer(thinking=True)
-    await interaction.followup.send(
-        f"Starting deep research on **{topic}**…\n"
-        "Running up to 15 agent turns with web search + arXiv. Results saved to your memory."
-    )
-    loop  = asyncio.get_event_loop()
-    reply = await loop.run_in_executor(
-        _executor,
-        lambda: _run_ask(
-            f"Comprehensive deep research on: '{topic}'\n\n"
-            "Use web_search (3+ angles), arxiv_search, url_fetch (2-3 sources), think to synthesise, "
-            f"memory_store tagged 'user:{uid}:deepdive:{topic[:25]}'.\n\n"
-            "Output: Executive Summary, Key Findings (with sources), Technical Details, "
-            "Recent Developments, Open Questions, Key Sources.",
-            uid, name,
-        ),
-    )
-    chunks = [reply[i : i + MAX_MSG_LEN] for i in range(0, max(len(reply), 1), MAX_MSG_LEN)]
-    for chunk in chunks:
-        await interaction.followup.send(chunk)
-
-
-@tree.command(name="models", description="List Ollama models available on this machine")
-async def slash_models(interaction: discord.Interaction) -> None:
-    def _models() -> str:
-        ollama_host = os.environ.get("OLLAMA_HOST", "http://host.docker.internal:11434")
-        try:
-            resp = httpx.get(f"{ollama_host}/api/tags", timeout=10)
-            resp.raise_for_status()
-            data   = resp.json()
-            models = data.get("models", [])
-            if not models:
-                return f"No Ollama models found at `{ollama_host}`."
-            lines = [f"**Ollama models** ({len(models)} at `{ollama_host}`)", "```"]
-            for m in sorted(models, key=lambda x: x.get("name", "")):
-                name_m  = m.get("name", "?")
-                size    = m.get("size", 0)
-                size_str = f"{size / 1e9:.1f}GB" if size > 1e8 else ""
-                modified = (m.get("modified_at") or "")[:10]
-                lines.append(f"  {name_m:<35} {size_str:<8} {modified}")
-            lines.append("```")
-            lines.append(f"Active: `{os.environ.get('JARVIS_MODEL', 'qwen3:8b')}`")
-            return "\n".join(lines)
-        except Exception as exc:
-            return f"⚠️ Could not reach Ollama at `{ollama_host}`: {exc}"
-
-    await _slash_reply(interaction, _models)
-
+# ── Help ──────────────────────────────────────────────────────────────────────
 
 @tree.command(name="help", description="Show all Jarvis commands and capabilities")
 async def slash_help(interaction: discord.Interaction) -> None:
     lines = [
-        "**Jarvis — command reference**",
+        "**Jarvis** — local AI assistant on OpenJarvis + qwen3:8b",
+        "",
+        "Just type in <#" + CHANNEL_NAME + "> or `@Jarvis <question>` — no command needed.",
         "",
         "**Conversation**",
-        "`/ask <query>` — ask anything (local qwen3 → Gemini → GitHub issue escalation)",
-        "`/ask-gemini <question>` — ask Gemini 3 Flash directly",
-        "`/agent <task>` — one-shot OrchestratorAgent task with full tool access",
+        "`/ask <query>` — ask anything",
+        "`/agent <task>` — explicit OrchestratorAgent run with all tools",
+        "`/react <task>` — NativeReActAgent: shows Thought → Action → Observation trace",
+        "`/ask-gemini <question>` — ask Google Gemini Flash directly",
         "",
-        "**Research & Information**",
-        "`/research <topic>` — multi-source research synthesis, saved to memory",
-        "`/deep-dive <topic>` — thorough 15-turn research with arXiv + web + memory",
+        "**Research & Info**",
+        "`/research <topic>` — multi-source synthesis, saved to memory",
+        "`/deep-dive <topic>` — thorough 15-turn research with arXiv + web",
         "`/arxiv <query>` — search arXiv papers",
         "`/papers [topic]` — latest AI/ML arXiv papers",
         "`/summarize <url>` — fetch and summarise a web page",
-        "`/weather [city]` — current conditions + 3-day forecast",
-        "`/brief` — morning brief: weather + top AI story + daily insight",
-        "`/digest` — on-demand Hacker News AI digest",
-        "`/trending` — what's trending in AI and tech right now",
+        "`/pdf <url>` — extract and summarise a PDF",
+        "`/weather [city]` — current conditions + forecast",
+        "`/brief` — morning brief: weather + top AI story + insight",
+        "`/digest` — on-demand HN AI digest",
+        "`/trending` — what's hot in AI/tech right now",
         "",
         "**Knowledge**",
         "`/explain <concept>` — three-level explanation: simple / intermediate / expert",
         "`/compare <X vs Y>` — structured comparison with web research",
-        "`/debate <topic>` — structured pros and cons analysis",
+        "`/debate <topic>` — pros/cons analysis with evidence",
+        "`/code <question>` — run Python or get a live coded example",
         "",
         "**Memory**",
         "`/memory <query>` — search your personal memory store",
-        "`/remember <fact>` — explicitly store something to your memory",
-        "`/forget <query>` — delete memories matching a query",
+        "`/remember <fact>` — store something explicitly",
+        "`/forget <query>` — delete matching memories",
         "`/whoami` — show everything Jarvis knows about you",
         "",
-        "**GitHub & Code**",
-        "`/propose <idea>` — draft a feature proposal and cut a GitHub issue",
-        "`/build-tool <description>` — spec and propose a new Jarvis tool",
-        "`/queue` — show open `claude-code-work` issues queued for Gemini",
-        "`/prs` — list open pull requests",
-        "`/pr <number>` — show PR details and changed files",
-        "`/merge <number>` — squash-merge a PR and delete the branch",
-        "",
         "**Skills & Tools**",
-        "`/run-skill <name> [args]` — execute a registered Jarvis skill pipeline",
+        "`/run-skill <name> [args]` — run a skill pipeline",
         "`/skills` — list available skill pipelines",
         "`/tools` — list all registered agent tools",
         "`/models` — list Ollama models available locally",
         "",
         "**Scheduler**",
-        "`/schedule cron|interval <value> <prompt>` — create a recurring background task",
-        "`/tasks` — list all scheduled tasks",
-        "`/pause-task <id>` · `/resume-task <id>` · `/cancel-task <id>` · `/task-log <id>`",
+        "`/schedule cron|interval <value> <prompt>` — create a background task",
+        "`/tasks` — list scheduled tasks",
+        "`/pause-task` · `/resume-task` · `/cancel-task` · `/task-log`",
         "",
         "**System**",
-        "`/status` — engine, model, Gemini/GitHub config, and host stats",
-        "`/health` — on-demand system health check",
+        "`/status` — model, Ollama, Gemini, Tavily, tools loaded",
+        "`/health` — CPU/RAM/GPU + Ollama connectivity",
+        "`/sysinfo` — detailed host stats",
+        "`/mcp` — MCP server status",
         "",
-        "**Prefix commands** — all commands also work as `!command` in any channel.",
-        "In #" + CHANNEL_NAME + " just type — no prefix needed. `@Jarvis <query>` works anywhere.",
-        "",
-        "*Stack: qwen3:8b (local) → Gemini 3 Flash → GitHub Actions → PR*",
+        "*Stack: qwen3:8b (local) → Gemini Flash (stuck) → that's it, no cloud needed*",
     ]
-    # Split into two messages to stay under 2000 chars
     full = "\n".join(lines)
     if len(full) <= 1900:
         await interaction.response.send_message(full, ephemeral=True)
@@ -2783,6 +1182,84 @@ async def slash_help(interaction: discord.Interaction) -> None:
         mid = len(lines) // 2
         await interaction.response.send_message("\n".join(lines[:mid]), ephemeral=True)
         await interaction.followup.send("\n".join(lines[mid:]), ephemeral=True)
+
+
+# ── Events ────────────────────────────────────────────────────────────────────
+
+@client.event
+async def on_ready() -> None:
+    log.info(
+        "Jarvis bot online: %s (id=%s) | #%s | tools=%d",
+        client.user, getattr(client.user, "id", "?"),
+        CHANNEL_NAME, len(AGENT_TOOLS),
+    )
+    if DISCORD_GUILD_ID:
+        guild_obj = discord.Object(id=DISCORD_GUILD_ID)
+        # Push current tree to guild first
+        try:
+            tree.copy_global_to(guild=guild_obj)
+            synced = await tree.sync(guild=guild_obj)
+            log.info("Slash commands synced to guild %d (%d commands)", DISCORD_GUILD_ID, len(synced))
+        except discord.Forbidden:
+            log.warning(
+                "Slash sync failed (403). Re-invite: "
+                "https://discord.com/api/oauth2/authorize"
+                "?client_id=%s&permissions=2147830336&scope=bot+applications.commands",
+                getattr(client.application, "id", client.user.id if client.user else "?"),
+            )
+        except Exception as exc:
+            log.warning("Slash sync failed: %s", exc)
+        # Clear stale global commands
+        try:
+            tree.clear_commands(guild=None)
+            await tree.sync()
+            log.info("Stale global commands cleared")
+        except Exception as exc:
+            log.warning("Global clear failed (non-fatal): %s", exc)
+    else:
+        try:
+            synced = await tree.sync()
+            log.info("Slash commands synced globally (%d commands)", len(synced))
+        except Exception as exc:
+            log.warning("Slash sync failed: %s", exc)
+    threading.Thread(target=_init_scheduler, daemon=True).start()
+
+
+@client.event
+async def on_message(message: discord.Message) -> None:
+    if message.author == client.user or message.author.bot:
+        return
+
+    query = extract_query(message)
+    if query is None:
+        return
+
+    user_id      = message.author.id
+    display_name = message.author.display_name
+    loop         = asyncio.get_event_loop()
+
+    log.info("[%s] %s (id=%d): %s", message.channel, display_name, user_id, query[:100])
+
+    thread_ctx = ""
+    if isinstance(message.channel, discord.Thread):
+        thread_ctx = await build_thread_context(message.channel, message.id)
+
+    async with message.channel.typing():
+        reply = await loop.run_in_executor(
+            _executor, _run_ask, query, user_id, display_name, thread_ctx
+        )
+
+    if isinstance(message.channel, discord.TextChannel) and len(reply) > MAX_MSG_LEN:
+        try:
+            thread = await message.create_thread(
+                name=f"Jarvis: {query[:50]}", auto_archive_duration=60
+            )
+            await send_chunked(thread, reply)
+            return
+        except discord.Forbidden:
+            pass
+
+    await send_chunked(message.channel, reply)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
