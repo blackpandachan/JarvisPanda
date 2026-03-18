@@ -10,7 +10,7 @@ COPY pyproject.toml README.md ./
 COPY src/ src/
 
 RUN pip install --no-cache-dir uv && \
-    uv pip install --system ".[server]" && \
+    uv pip install --system ".[server,tools-search]" && \
     uv pip install --system "discord.py>=2.3" pynvml croniter
 
 COPY deploy/discord/bot.py /bot.py

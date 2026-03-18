@@ -374,6 +374,17 @@ def _search_user_memory(query: str, user_id: int) -> list[dict]:
 
 # ── Core agent call ───────────────────────────────────────────────────────────
 
+def _current_date_prefix() -> str:
+    """Return a date/time context line to prepend to every query."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    return (
+        f"[Current date/time: {now.strftime('%A, %B %d, %Y')} at {now.strftime('%H:%M UTC')}]\n"
+        "For any question about current events, prices, news, or recent data: "
+        "use web_search with today's date in the query to get up-to-date results.\n\n"
+    )
+
+
 def _run_ask(
     query: str,
     user_id: int | None = None,
@@ -383,7 +394,7 @@ def _run_ask(
     """Synchronous Jarvis call in thread pool. Includes user prefix + thread context."""
     j = _get_jarvis()
 
-    parts: list[str] = []
+    parts: list[str] = [_current_date_prefix()]
     if user_id is not None:
         parts.append(_user_prefix(user_id, display_name))
     if thread_history:
