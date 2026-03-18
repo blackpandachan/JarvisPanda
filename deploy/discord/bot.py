@@ -1187,14 +1187,15 @@ async def on_ready() -> None:
         client.user, getattr(client.user, "id", "?"),
         CHANNEL_NAME, COMMAND_PREFIX, len(AGENT_TOOLS),
     )
-    # Sync slash commands
+    # Sync slash commands — always clear guild cache first to avoid signature mismatches
     if DISCORD_GUILD_ID:
-        # Guild sync is instant — prefer this when DISCORD_GUILD_ID is set
         try:
             guild_obj = discord.Object(id=DISCORD_GUILD_ID)
+            # Clear stale guild commands, then re-push the current tree
+            tree.clear_commands(guild=guild_obj)
             tree.copy_global_to(guild=guild_obj)
-            await tree.sync(guild=guild_obj)
-            log.info("Slash commands synced to guild %d", DISCORD_GUILD_ID)
+            synced = await tree.sync(guild=guild_obj)
+            log.info("Slash commands synced to guild %d (%d commands)", DISCORD_GUILD_ID, len(synced))
         except discord.Forbidden:
             log.warning(
                 "Slash command guild sync failed (403 Missing Access). "
@@ -1206,10 +1207,9 @@ async def on_ready() -> None:
         except Exception as exc:
             log.warning("Slash command guild sync failed: %s", exc)
     else:
-        # Fall back to global sync (takes up to 1 hour to propagate)
         try:
-            await tree.sync()
-            log.info("Slash commands synced globally")
+            synced = await tree.sync()
+            log.info("Slash commands synced globally (%d commands)", len(synced))
         except Exception as exc:
             log.warning("Slash command global sync failed: %s", exc)
     # Start scheduler in background thread after bot is ready
