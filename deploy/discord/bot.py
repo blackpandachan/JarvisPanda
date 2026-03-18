@@ -901,17 +901,31 @@ async def on_ready() -> None:
         client.user, getattr(client.user, "id", "?"),
         CHANNEL_NAME, COMMAND_PREFIX, len(AGENT_TOOLS),
     )
-    # Sync slash commands — guild sync is instant, global takes ~1 hour
-    try:
-        if DISCORD_GUILD_ID:
+    # Sync slash commands
+    if DISCORD_GUILD_ID:
+        # Guild sync is instant — prefer this when DISCORD_GUILD_ID is set
+        try:
             guild_obj = discord.Object(id=DISCORD_GUILD_ID)
             tree.copy_global_to(guild=guild_obj)
             await tree.sync(guild=guild_obj)
             log.info("Slash commands synced to guild %d", DISCORD_GUILD_ID)
-        await tree.sync()
-        log.info("Slash commands synced globally")
-    except Exception as exc:
-        log.warning("Slash command sync failed: %s", exc)
+        except discord.Forbidden:
+            log.warning(
+                "Slash command guild sync failed (403 Missing Access). "
+                "Re-invite the bot with the applications.commands scope: "
+                "https://discord.com/api/oauth2/authorize"
+                "?client_id=%s&permissions=2147830336&scope=bot+applications.commands",
+                getattr(client.application, "id", client.user.id if client.user else "?"),
+            )
+        except Exception as exc:
+            log.warning("Slash command guild sync failed: %s", exc)
+    else:
+        # Fall back to global sync (takes up to 1 hour to propagate)
+        try:
+            await tree.sync()
+            log.info("Slash commands synced globally")
+        except Exception as exc:
+            log.warning("Slash command global sync failed: %s", exc)
     # Start scheduler in background thread after bot is ready
     threading.Thread(target=_init_scheduler, daemon=True).start()
 
