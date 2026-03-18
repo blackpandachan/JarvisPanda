@@ -1187,12 +1187,13 @@ async def on_ready() -> None:
         client.user, getattr(client.user, "id", "?"),
         CHANNEL_NAME, COMMAND_PREFIX, len(AGENT_TOOLS),
     )
-    # Sync slash commands — always clear guild cache first to avoid signature mismatches
+    # Sync slash commands.
+    # Guild sync first, then wipe stale globals (clears old global registrations that
+    # can cause CommandSignatureMismatch when they conflict with guild commands).
     if DISCORD_GUILD_ID:
+        guild_obj = discord.Object(id=DISCORD_GUILD_ID)
+        # 1. Push current tree to guild
         try:
-            guild_obj = discord.Object(id=DISCORD_GUILD_ID)
-            # Clear stale guild commands, then re-push the current tree
-            tree.clear_commands(guild=guild_obj)
             tree.copy_global_to(guild=guild_obj)
             synced = await tree.sync(guild=guild_obj)
             log.info("Slash commands synced to guild %d (%d commands)", DISCORD_GUILD_ID, len(synced))
@@ -1206,6 +1207,13 @@ async def on_ready() -> None:
             )
         except Exception as exc:
             log.warning("Slash command guild sync failed: %s", exc)
+        # 2. Wipe stale global commands from Discord (non-fatal)
+        try:
+            tree.clear_commands(guild=None)
+            await tree.sync()
+            log.info("Stale global commands cleared")
+        except Exception as exc:
+            log.warning("Global command clear failed (non-fatal): %s", exc)
     else:
         try:
             synced = await tree.sync()
