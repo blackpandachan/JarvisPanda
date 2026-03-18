@@ -53,6 +53,7 @@ DISCORD_WEBHOOK   = os.environ.get("DISCORD_DIGEST_WEBHOOK", "")
 OLLAMA_HOST          = os.environ.get("OLLAMA_HOST", "http://host.docker.internal:11434")
 GEMINI_API_KEY       = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_IMAGE_MODEL   = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image-preview")
+JARVIS_SERVER_URL    = os.environ.get("JARVIS_SERVER_URL", "http://jarvis-server:8000")
 
 _GUILD_ID_STR    = os.environ.get("DISCORD_GUILD_ID", "")
 DISCORD_GUILD_ID: int | None = int(_GUILD_ID_STR) if _GUILD_ID_STR.isdigit() else None
@@ -1559,6 +1560,304 @@ async def slash_security_scan(interaction: discord.Interaction, code: str) -> No
     )
 
 
+# ── Managed Agents (jarvis-server REST API) ───────────────────────────────────
+
+def _server(method: str, path: str, **kwargs: Any) -> Any:
+    """Call the jarvis-server REST API. Returns parsed JSON or raises."""
+    url = f"{JARVIS_SERVER_URL}{path}"
+    resp = httpx.request(method, url, timeout=30, **kwargs)
+    resp.raise_for_status()
+    return resp.json() if resp.content else {}
+
+
+def _find_agent(name_prefix: str) -> "tuple[dict | None, str]":
+    """Find a managed agent by name prefix. Returns (agent_dict, error_str)."""
+    try:
+        agents = _server("GET", "/v1/managed-agents")
+        items = agents if isinstance(agents, list) else agents.get("items", [])
+        matches = [a for a in items if a["name"].lower().startswith(name_prefix.lower())]
+        if not matches:
+            return None, f"No agent found matching `{name_prefix}`. Use `/agents` to list."
+        if len(matches) > 1:
+            names = ", ".join(f"`{a['name']}`" for a in matches)
+            return None, f"Multiple agents match `{name_prefix}`: {names}"
+        return matches[0], ""
+    except Exception as exc:
+        return None, f"Could not reach jarvis-server: `{exc}`"
+
+
+async def _ensure_discord_channel(
+    guild: discord.Guild,
+    channel_name: str,
+) -> "discord.TextChannel | None":
+    """Return existing channel by name or create it; returns None on failure."""
+    existing = discord.utils.get(guild.text_channels, name=channel_name)
+    if existing:
+        return existing
+    try:
+        ch = await guild.create_text_channel(
+            name=channel_name,
+            topic=f"Auto-created by Jarvis for agent: {channel_name}",
+        )
+        return ch
+    except discord.Forbidden:
+        log.warning("No permission to create channel #%s", channel_name)
+        return None
+
+
+@tree.command(name="create-agent", description="Launch a new managed agent (optionally with its own Discord channel)")
+@discord.app_commands.describe(
+    name="Agent name (used as Discord channel name too)",
+    instruction="What the agent should do on every run",
+    schedule="Schedule: 'manual', 'interval:3600' (seconds), or 'cron:0 9 * * *'",
+    strategy="Strategy: 'research' (web+memory), 'monitor' (watch+alert), 'code' (dev tasks), or 'custom'",
+    create_channel="Create a dedicated Discord channel for this agent's output",
+)
+async def slash_create_agent(
+    interaction: discord.Interaction,
+    name: str,
+    instruction: str,
+    schedule: str = "manual",
+    strategy: str = "research",
+    create_channel: bool = False,
+) -> None:
+    await interaction.response.defer(thinking=True)
+
+    # Parse schedule
+    sched_type, sched_value = "manual", ""
+    if schedule.startswith("interval:"):
+        sched_type, sched_value = "interval", schedule.split(":", 1)[1]
+    elif schedule.startswith("cron:"):
+        sched_type, sched_value = "cron", schedule.split(":", 1)[1]
+
+    # Strategy presets
+    STRATEGY_TOOLS: dict[str, list[str]] = {
+        "research":  ["think", "web_search", "arxiv_search", "memory_store", "memory_search", "url_fetch"],
+        "monitor":   ["think", "web_search", "system_monitor", "memory_store", "memory_search"],
+        "code":      ["think", "file_read", "code_interpreter", "web_search", "memory_store"],
+        "custom":    ["think", "web_search", "memory_store", "memory_search"],
+    }
+    tools = STRATEGY_TOOLS.get(strategy, STRATEGY_TOOLS["research"])
+
+    # Create Discord channel if requested
+    discord_channel: discord.TextChannel | None = None
+    channel_slug = name.lower().replace(" ", "-")[:80]
+    if create_channel and interaction.guild:
+        discord_channel = await _ensure_discord_channel(interaction.guild, f"agent-{channel_slug}")
+
+    # Build instruction with Discord context
+    full_instruction = instruction
+    if discord_channel:
+        tools = list(set(tools + ["channel_send"]))
+        full_instruction += (
+            f"\n\nAfter completing each run, post a concise summary to Discord "
+            f"channel ID {discord_channel.id} using the channel_send tool."
+        )
+
+    config: dict[str, Any] = {
+        "schedule_type": sched_type,
+        "schedule_value": sched_value or None,
+        "tools": tools,
+        "instruction": full_instruction,
+        "memory_extraction": "causality_graph",
+        "observation_compression": "summarize",
+        "retrieval_strategy": "hybrid_with_self_eval",
+        "task_decomposition": "phased",
+        "learning_enabled": True,
+    }
+    if DISCORD_WEBHOOK:
+        config["discord_webhook"] = DISCORD_WEBHOOK
+    if discord_channel:
+        config["discord_channel_id"] = discord_channel.id
+        config["discord_channel_name"] = discord_channel.name
+
+    try:
+        agent = _server("POST", "/v1/managed-agents", json={"name": name, "config": config})
+        agent_id = agent.get("id", "?")[:8]
+        lines = [
+            f"✅ **Agent `{name}` launched** (id: `{agent_id}`)",
+            f"Strategy: `{strategy}` · Schedule: `{schedule}`",
+            f"Tools: {', '.join(f'`{t}`' for t in tools[:6])}{'…' if len(tools) > 6 else ''}",
+        ]
+        if discord_channel:
+            lines.append(f"Output channel: {discord_channel.mention}")
+        if sched_type == "manual":
+            lines.append("_Run manually with `/run-agent " + name + "`_")
+        await interaction.followup.send("\n".join(lines))
+    except Exception as exc:
+        await interaction.followup.send(f"⚠️ Failed to create agent: `{exc}`")
+
+
+@tree.command(name="agents", description="List all managed agents and their status")
+async def slash_agents(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(thinking=True)
+    try:
+        data = _server("GET", "/v1/managed-agents")
+        items = data if isinstance(data, list) else data.get("items", [])
+        if not items:
+            await interaction.followup.send("No managed agents yet. Use `/create-agent` to launch one.")
+            return
+        STATUS_ICON = {
+            "idle": "🟢", "running": "🔵", "paused": "⏸️",
+            "error": "🔴", "stalled": "🟡", "needs_attention": "🟠",
+            "budget_exceeded": "🟠", "archived": "⚫",
+        }
+        lines = ["**Managed Agents**", ""]
+        for a in items:
+            icon  = STATUS_ICON.get(a.get("status", "idle"), "⚪")
+            sched = a.get("schedule_type", "manual")
+            runs  = a.get("total_runs", 0)
+            cost  = a.get("total_cost") or 0
+            lines.append(
+                f"{icon} **{a['name']}** · `{sched}` · {runs} runs · ${cost:.3f}"
+                f"\n  `{a['id'][:8]}`  status: `{a.get('status','idle')}`"
+            )
+        await interaction.followup.send("\n".join(lines)[:1900])
+    except Exception as exc:
+        await interaction.followup.send(f"⚠️ Could not reach jarvis-server: `{exc}`")
+
+
+@tree.command(name="run-agent", description="Trigger a manual run of a managed agent now")
+@discord.app_commands.describe(name="Agent name (or prefix)")
+async def slash_run_agent(interaction: discord.Interaction, name: str) -> None:
+    await interaction.response.defer(thinking=True)
+    agent, err = _find_agent(name)
+    if err:
+        await interaction.followup.send(f"⚠️ {err}")
+        return
+    try:
+        _server("POST", f"/v1/managed-agents/{agent['id']}/run")
+        await interaction.followup.send(f"▶️ **`{agent['name']}`** is running.")
+    except Exception as exc:
+        await interaction.followup.send(f"⚠️ `{exc}`")
+
+
+@tree.command(name="pause-agent", description="Pause a managed agent")
+@discord.app_commands.describe(name="Agent name (or prefix)")
+async def slash_pause_agent(interaction: discord.Interaction, name: str) -> None:
+    await interaction.response.defer(thinking=True)
+    agent, err = _find_agent(name)
+    if err:
+        await interaction.followup.send(f"⚠️ {err}")
+        return
+    try:
+        _server("POST", f"/v1/managed-agents/{agent['id']}/pause")
+        await interaction.followup.send(f"⏸️ **`{agent['name']}`** paused.")
+    except Exception as exc:
+        await interaction.followup.send(f"⚠️ `{exc}`")
+
+
+@tree.command(name="resume-agent", description="Resume a paused managed agent")
+@discord.app_commands.describe(name="Agent name (or prefix)")
+async def slash_resume_agent(interaction: discord.Interaction, name: str) -> None:
+    await interaction.response.defer(thinking=True)
+    agent, err = _find_agent(name)
+    if err:
+        await interaction.followup.send(f"⚠️ {err}")
+        return
+    try:
+        _server("POST", f"/v1/managed-agents/{agent['id']}/resume")
+        await interaction.followup.send(f"▶️ **`{agent['name']}`** resumed.")
+    except Exception as exc:
+        await interaction.followup.send(f"⚠️ `{exc}`")
+
+
+@tree.command(name="delete-agent", description="Permanently delete a managed agent")
+@discord.app_commands.describe(name="Agent name (or prefix)")
+async def slash_delete_agent(interaction: discord.Interaction, name: str) -> None:
+    await interaction.response.defer(thinking=True)
+    agent, err = _find_agent(name)
+    if err:
+        await interaction.followup.send(f"⚠️ {err}")
+        return
+    try:
+        _server("DELETE", f"/v1/managed-agents/{agent['id']}")
+        await interaction.followup.send(f"🗑️ **`{agent['name']}`** deleted.")
+    except Exception as exc:
+        await interaction.followup.send(f"⚠️ `{exc}`")
+
+
+@tree.command(name="agent-task", description="Give a managed agent a one-off task to complete")
+@discord.app_commands.describe(
+    name="Agent name (or prefix)",
+    task="The task description",
+    immediate="Run immediately (interrupts current run) vs queued for next run",
+)
+async def slash_agent_task(
+    interaction: discord.Interaction,
+    name: str,
+    task: str,
+    immediate: bool = False,
+) -> None:
+    await interaction.response.defer(thinking=True)
+    agent, err = _find_agent(name)
+    if err:
+        await interaction.followup.send(f"⚠️ {err}")
+        return
+    try:
+        mode = "immediate" if immediate else "queued"
+        _server("POST", f"/v1/managed-agents/{agent['id']}/messages",
+                json={"content": task, "mode": mode})
+        label = "🔔 Sent immediately" if immediate else "📬 Queued for next run"
+        await interaction.followup.send(
+            f"{label} → **`{agent['name']}`**\n> {task[:200]}"
+        )
+    except Exception as exc:
+        await interaction.followup.send(f"⚠️ `{exc}`")
+
+
+@tree.command(name="agent-log", description="Show recent execution traces for a managed agent")
+@discord.app_commands.describe(name="Agent name (or prefix)")
+async def slash_agent_log(interaction: discord.Interaction, name: str) -> None:
+    await interaction.response.defer(thinking=True)
+    agent, err = _find_agent(name)
+    if err:
+        await interaction.followup.send(f"⚠️ {err}")
+        return
+    try:
+        data   = _server("GET", f"/v1/managed-agents/{agent['id']}/traces")
+        traces = data if isinstance(data, list) else data.get("items", [])
+        if not traces:
+            await interaction.followup.send(f"No traces yet for **`{agent['name']}`**.")
+            return
+        lines = [f"**`{agent['name']}`** — last {min(len(traces), 8)} runs", ""]
+        for t in traces[:8]:
+            icon   = "✅" if t.get("outcome") == "success" else "❌"
+            dur    = t.get("duration", 0)
+            steps  = t.get("steps", 0)
+            ts     = t.get("started_at", 0)
+            dt     = __import__("datetime").datetime.fromtimestamp(ts).strftime("%m/%d %H:%M") if ts else "?"
+            err_m  = t.get("error_message", "")[:60]
+            lines.append(f"{icon} `{dt}` · {dur:.1f}s · {steps} steps" + (f"\n  ↳ {err_m}" if err_m else ""))
+        await interaction.followup.send("\n".join(lines)[:1900])
+    except Exception as exc:
+        await interaction.followup.send(f"⚠️ `{exc}`")
+
+
+@tree.command(name="new-channel", description="Create a new Discord text channel (for agent output or any use)")
+@discord.app_commands.describe(
+    channel_name="Channel name (lowercase, hyphens ok)",
+    topic="Optional channel topic/description",
+)
+async def slash_new_channel(
+    interaction: discord.Interaction,
+    channel_name: str,
+    topic: str = "",
+) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+    slug = channel_name.lower().replace(" ", "-")[:80]
+    await interaction.response.defer(thinking=True)
+    try:
+        ch = await interaction.guild.create_text_channel(name=slug, topic=topic or None)
+        await interaction.followup.send(f"✅ Created {ch.mention}")
+    except discord.Forbidden:
+        await interaction.followup.send("⚠️ I don't have permission to create channels (need **Manage Channels**).")
+    except Exception as exc:
+        await interaction.followup.send(f"⚠️ `{exc}`")
+
+
 # ── Help ──────────────────────────────────────────────────────────────────────
 
 @tree.command(name="help", description="Show all Jarvis commands and capabilities")
@@ -1595,6 +1894,12 @@ async def slash_help(interaction: discord.Interaction) -> None:
         "**Memory & Knowledge Base**",
         "`/memory` · `/remember` · `/forget` · `/whoami`",
         "`/index <url or text>` — save to knowledge base",
+        "",
+        "**Managed Agents**",
+        "`/create-agent name instruction [schedule] [strategy] [create_channel]`",
+        "`/agents` · `/run-agent` · `/pause-agent` · `/resume-agent` · `/delete-agent`",
+        "`/agent-task name task` · `/agent-log name`",
+        "`/new-channel name` — create a Discord channel (agents get their own automatically)",
         "",
         "**Skills & Tools**",
         "`/run-skill <name> [args]` · `/skills` · `/tools` · `/models`",

@@ -33,8 +33,10 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"   # reach Ollama on host
     env_file: ../.env
+    environment:
+      JARVIS_SERVER_URL: "http://jarvis-server:8000"
     restart: unless-stopped
-    # No dependency on jarvis-server — runs its own agent pipeline directly
+    # No dependency on jarvis-server for agent queries, but uses REST API for managed agents
 
   # ── HN AI digest scheduler ──────────────────────────────────────────────────
   jarvis-digest:

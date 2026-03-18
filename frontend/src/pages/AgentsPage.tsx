@@ -218,6 +218,11 @@ interface WizardState {
   observationCompression: string;
   retrievalStrategy: string;
   taskDecomposition: string;
+  // Discord output
+  discordEnabled: boolean;
+  discordWebhook: string;
+  discordChannelName: string;
+  discordCreateChannel: boolean;
 }
 
 function LaunchWizard({
@@ -244,6 +249,10 @@ function LaunchWizard({
     observationCompression: 'summarize',
     retrievalStrategy: 'hybrid_with_self_eval',
     taskDecomposition: 'phased',
+    discordEnabled: false,
+    discordWebhook: import.meta.env.VITE_DISCORD_WEBHOOK || '',
+    discordChannelName: '',
+    discordCreateChannel: false,
   });
   const [launching, setLaunching] = useState(false);
   const models = useAppStore((s) => s.models);
@@ -344,6 +353,15 @@ function LaunchWizard({
       config.observation_compression = wizard.observationCompression;
       config.retrieval_strategy = wizard.retrievalStrategy;
       config.task_decomposition = wizard.taskDecomposition;
+      if (wizard.discordEnabled) {
+        config.discord_webhook = wizard.discordWebhook || undefined;
+        config.discord_channel_name = wizard.discordChannelName || undefined;
+        config.discord_create_channel = wizard.discordCreateChannel;
+        // Ensure channel_send is available
+        if (!wizard.selectedTools.includes('channel_send')) {
+          config.tools = [...wizard.selectedTools, 'channel_send'];
+        }
+      }
       const created = await createManagedAgent({
         name: wizard.name,
         template_id: wizard.templateId || undefined,
@@ -827,6 +845,66 @@ function LaunchWizard({
                   </select>
                 </div>
               </div>
+              {/* Discord Output */}
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
+                    Publish results to Discord
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => update({ discordEnabled: !wizard.discordEnabled })}
+                    className="relative w-9 h-5 rounded-full transition-colors"
+                    style={{ background: wizard.discordEnabled ? '#5865F2' : 'var(--color-border)' }}
+                  >
+                    <span
+                      className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform"
+                      style={{ transform: wizard.discordEnabled ? 'translateX(18px)' : 'translateX(2px)' }}
+                    />
+                  </button>
+                </div>
+                {wizard.discordEnabled && (
+                  <div className="space-y-2 pl-2" style={{ borderLeft: '2px solid #5865F2' }}>
+                    <div>
+                      <div className="text-[10px] mb-1" style={{ color: 'var(--color-text-tertiary)' }}>Webhook URL (for digest posts)</div>
+                      <input
+                        type="text"
+                        placeholder="https://discord.com/api/webhooks/..."
+                        value={wizard.discordWebhook}
+                        onChange={(e) => update({ discordWebhook: e.target.value })}
+                        className="w-full px-2 py-1.5 rounded text-xs bg-transparent outline-none"
+                        style={{ border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                      />
+                    </div>
+                    <div>
+                      <div className="text-[10px] mb-1" style={{ color: 'var(--color-text-tertiary)' }}>
+                        Discord channel name <span style={{ color: 'var(--color-text-tertiary)' }}>(optional — agent posts here)</span>
+                      </div>
+                      <input
+                        type="text"
+                        placeholder="e.g. jarvis-research"
+                        value={wizard.discordChannelName}
+                        onChange={(e) => update({ discordChannelName: e.target.value.toLowerCase().replace(/\s+/g, '-') })}
+                        className="w-full px-2 py-1.5 rounded text-xs bg-transparent outline-none"
+                        style={{ border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                      />
+                    </div>
+                    <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: 'var(--color-text-secondary)' }}>
+                      <input
+                        type="checkbox"
+                        checked={wizard.discordCreateChannel}
+                        onChange={(e) => update({ discordCreateChannel: e.target.checked })}
+                        className="rounded"
+                      />
+                      Auto-create this Discord channel if it doesn't exist
+                    </label>
+                    <div className="text-[10px] p-2 rounded" style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text-tertiary)' }}>
+                      The <code>channel_send</code> tool will be added automatically. Agent instructions should reference posting updates to Discord.
+                    </div>
+                  </div>
+                )}
+              </div>
+
               {/* Agent Strategies — shown for monitor_operative (default when no template selected) */}
               {(!wizard.templateId || templates.find((t) => t.id === wizard.templateId)?.agent_type === 'monitor_operative') && (
                 <div>
